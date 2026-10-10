@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.1.0
+
+### 变更：新会话不再依赖任何工作区
+
+「新会话」改为直接调用 `sessions.create({ cwd })` —— 会话**不属于任何工作区**，
+一建立就在**未分组**里，侧边栏不会多出一个分组，也没有「建了再拆」的过程。
+
+随之删掉的是整套临时工作区机制：注册与注销、`reclaim`（新建时回收上一个空白会话）、
+启动清扫、注册表、认领集、临时分组标记与置顶样式。`reclaim` 会连带丢掉草稿，
+现在这条路径不再存在。
+
+### 新增
+
+- **composer gate**：覆盖 `conversation.composer.bar` 插槽，让无工作区的空白会话
+  输入框可用。gate 未就绪时「新会话」自动退回 DSH 原生行为，不会造出打不了字的会话。
+- **DSH 侧补丁**（可选，5 个字符）：DSH 本体的 `chipTitle` 判定会把「无工作区的空白
+  会话」的输入框强制置为 inert，这一处无法从插件侧旁路。补丁把该判定里的 `"ready"`
+  换成 `"readx"`（等长替换），使 `cwd` 兜底生效。工具与说明见
+  [`tools/dsh-composer-gate/`](tools/dsh-composer-gate/README.md)。
+- 诊断新增 `composerChain` / `composerGate` / `boundSession` 等字段与一条渲染轨迹，
+  用于判断「gate 是否真的接管了输入栏」。
+
+### 修复
+
+- **排序维护器会把侧边栏写空**（严重）：它把自己的写入重新触发成新的一轮写入，
+  无限循环导致页面卡死、侧边栏一个分组都渲染不出来。现在每个分组每次页面加载最多写一次，
+  且会话列表未就绪（`ids` 为空 / `phase` 非 ready）时绝不写入，也不用空顺序覆盖非空顺序。
+- **composer gate 抹掉输入框**：DSH 的输入栏是 `React.memo(...)` 对象，
+  `typeof !== 'function'` 的判定让它误以为没拿到组件而渲染 `null`。改为识别
+  memo / forwardRef 的 `$$typeof`。
+- gate 的注册改为订阅式（`slots.subscribe` + 重试阶梯），不再依赖一次性的
+  `slots.inject` 回调，因此在页面已加载、插件热更新后才到达时也能生效。
+
 ## 1.0.0
 
 合并版本：把 `dsh-projectless-session`（无工作区会话 provider）与 `dsh-ungrouped-top`

@@ -1,30 +1,23 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
-import type { WorkspaceId, WorkspaceView } from '@deepseek-ai/dsh-api-workspace-controller/client'
+import type { WorkspaceId } from '@deepseek-ai/dsh-api-workspace-controller/client'
 import type {} from '@deepseek-ai/dsh-api-session-controller/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { isProjectlessPath } from '../shared/paths.ts'
 import { report } from './diagnostics.ts'
-import { PROJECTLESS_LOCALE_NS } from './locales.ts'
 
 /**
- * Sidebar behaviour that the picker cannot express on its own:
+ * Sidebar behaviour the picker cannot express on its own:
  *
  * 1) Position — DSH derives sidebar groups by appending the Ungrouped bucket
  *    after every Workspace group (`dsh-client-ui-workspace` `groupByWorkspace`),
  *    and that bucket carries no drag handle, so it can neither be reordered nor
- *    moved. The rows are plain block children of the `[role="tree"]` scroll
+ *    moved. Its rows are plain block children of the `[role="tree"]` scroll
  *    container, which means `order` has no effect there either. The stylesheet
  *    below turns that container into a flex column so `order` applies, then
- *    lifts Ungrouped with `order: -1`. The selector keys off the row marker
- *    `data-row-key="workspace:"`, which DSH emits only for the Ungrouped
- *    section, so the rule is inert in every other sidebar view.
- *
- *    The temporary Workspace of a blank projectless Session is lifted above
- *    even that (`order: -2`), because a brand-new Session appearing *below* the
- *    loose-Session list is exactly what reads as "the new chat landed in the
- *    wrong place".
+ *    lifts Ungrouped above every Workspace group with `order: -1`. The selector
+ *    keys off the row marker `data-row-key="workspace:"`, which DSH emits only
+ *    for the Ungrouped section, so the rule is inert in every other view.
  *
  * 2) Order — DSH keeps ONE ordering mode for the whole sidebar. Under "manual"
  *    mode a group that owns a stored order freezes it, and DSH hands a stored
@@ -37,44 +30,25 @@ import { PROJECTLESS_LOCALE_NS } from './locales.ts'
  *    is written at all.
  */
 
-/**
- * The slot whose registration carries the sidebar's view store. DSH declares
- * it internally, so it is not part of the published `SlotMap`; the string is
- * the contract this plugin relies on.
- */
+/** The slot whose registration carries the sidebar's view store. */
 const SIDEBAR_SLOT = 'sidebar.workspaces' as never
 
 /** The container DSH renders the grouped sidebar rows into. */
 const TREE = '[role="tree"]:has([data-row-key="workspace:"])'
 
-/** Marks the sidebar section of the temporary projectless Workspace. */
-const TEMP_ATTR = 'data-dsh-projectless-temp'
-
+/**
+ * The `display:flex` half is what makes `order` apply to the sidebar's block
+ * rows. It was switched off while a blank sidebar was being diagnosed, and the
+ * cause turned out to be the order *writer*, not this stylesheet — the empty
+ * sidebar came from `keepRecencyOrder` re-entering itself, not from layout. It
+ * is restored here, verified stable (sidebar still renders every group).
+ */
 const CSS = [
-  '/* dsh-projectless: keep Ungrouped above every workspace group, and the */',
-  '/* projectless temporary Workspace above Ungrouped while it exists.      */',
+  '/* dsh-projectless: keep Ungrouped above every workspace group. */',
   `${TREE}{display:flex;flex-direction:column}`,
   `${TREE}>*{flex:0 0 auto}`,
   `${TREE}>div:has([data-row-key="workspace:"]){order:-1}`,
-  `${TREE}>div[${TEMP_ATTR}]{order:-2}`,
 ].join('\n')
-
-/** The picker label in the active language, used as the temporary group's title. */
-export function projectlessLabel(ctx: Context): string | undefined {
-  try {
-    const label = ctx.locale.bind(PROJECTLESS_LOCALE_NS)('picker.projectless')
-    if (typeof label === 'string' && label !== '') return label
-  } catch {
-    // The dictionary is registered by this plugin's own apply; absence is fine.
-  }
-  return undefined
-}
-
-/** The final path segment — the label DSH shows before a Workspace gets renamed. */
-function baseName(path: string): string {
-  const segments = path.replace(/\\/g, '/').split('/').filter(segment => segment.length > 0)
-  return segments[segments.length - 1] ?? ''
-}
 
 export function installStyles(ctx: Context, pluginName: string): void {
   ctx.effect(() => {
@@ -87,131 +61,16 @@ export function installStyles(ctx: Context, pluginName: string): void {
 }
 
 /**
- * Tag the sidebar section owned by the temporary projectless Workspace, so the
- * stylesheet can lift it above Ungrouped.
- *
- * The section is recognised by its group label — this plugin's own localized
- * string — because the temporary Workspace id is not known ahead of time. The
- * tag is (re)applied on every Workspace list change, deferred past React's
- * commit by a timeout plus a frame.
- */
-export function markTemporaryGroups(ctx: Context, pluginName: string): void {
-  ctx.effect(() => {
-    const mark = (): void => {
-      const label = projectlessLabel(ctx)
-      if (label === undefined) return
-      let sections: NodeListOf<HTMLElement>
-      try {
-        sections = document.querySelectorAll<HTMLElement>('[role="tree"] > div')
-      } catch {
-        return
-      }
-      for (const section of sections) {
-        let row: Element | null
-        try {
-          row = section.querySelector('[data-row-key^="workspace:"]')
-        } catch {
-          continue
-        }
-        const text = row === null ? '' : String(row.textContent ?? '').trim()
-        if (text === label) section.setAttribute(TEMP_ATTR, '1')
-        else section.removeAttribute(TEMP_ATTR)
-      }
-    }
-    const schedule = (): void => {
-      window.setTimeout(mark, 0)
-      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(mark)
-    }
-    let unsubscribe = (): void => {}
-    try {
-      unsubscribe = ctx.workspaces.list.subscribe(schedule) || (() => {})
-    } catch {
-      // The Workspace service is always present for a sidebar view.
-    }
-    schedule()
-    return () => {
-      try { unsubscribe() } catch { /* already gone */ }
-      try {
-        for (const section of document.querySelectorAll(`[${TEMP_ATTR}]`)) section.removeAttribute(TEMP_ATTR)
-      } catch { /* DOM is gone */ }
-    }
-  }, `${pluginName}: tag the temporary workspace section`)
-}
-
-/**
- * Rename a freshly created projectless Workspace the moment it shows up, rather
- * than waiting for the provisioning round trip to finish.
- *
- * The picker renames it too, at the end of its own provisioning; this watcher
- * only makes the rename win the race, so the directory name (a `session-…`
- * label) does not sit on the sidebar for the whole of that trip.
- * @returns a stop function.
- */
-export function watchTemporaryLabel(ctx: Context, label: string | undefined): () => void {
-  if (label === undefined) return () => {}
-  let stopped = false
-  const fix = (): void => {
-    if (stopped) return
-    let items: readonly WorkspaceView[]
-    try {
-      items = ctx.workspaces.list.getSnapshot().items ?? []
-    } catch {
-      return
-    }
-    for (const workspace of items) {
-      if (!isProjectlessPath(workspace.path)) continue
-      if (workspace.title === label) continue
-      if (workspace.title !== baseName(workspace.path)) continue
-      try {
-        void ctx.workspaces.rename(workspace.workspaceId, label).catch(() => {})
-      } catch { /* the row is already gone */ }
-    }
-  }
-  let unsubscribe = (): void => {}
-  try {
-    unsubscribe = ctx.workspaces.list.subscribe(fix) || (() => {})
-  } catch { /* nothing to observe */ }
-  fix()
-  return () => {
-    stopped = true
-    try { unsubscribe() } catch { /* already gone */ }
-  }
-}
-
-/**
- * Re-apply the group label until it sticks: a rename can be overtaken by the
- * Workspace list refresh that immediately follows provisioning, which leaves
- * the temporary directory basename (the `session-…` name) on the group.
- */
-export function reconcileLabel(ctx: Context, sessionId: SessionId, label: string | undefined): void {
-  if (label === undefined) return
-  const attempt = (remaining: number): void => {
-    let workspace: WorkspaceView | undefined
-    try {
-      workspace = (ctx.workspaces.list.getSnapshot().items ?? []).find(item => item.sessionIds.includes(sessionId))
-    } catch {
-      workspace = undefined
-    }
-    if (workspace !== undefined) {
-      if (!isProjectlessPath(workspace.path)) return
-      if (workspace.title === label) return
-      try {
-        void ctx.workspaces.rename(workspace.workspaceId, label).catch(() => {})
-      } catch { /* the row is already gone */ }
-    }
-    if (remaining > 0) window.setTimeout(() => { attempt(remaining - 1) }, 400)
-  }
-  attempt(5)
-}
-
-/**
  * The sidebar's view-store instance: current viewing state (grouping mode,
  * ordering mode, stored per-account orders) plus the engine's own write set.
  * The slot registration carries it as `store`; the owner memoises `create()`,
  * so this always hands back the live instance.
- * @returns the instance, or undefined when the sidebar is not mounted.
  */
-function workspaceViewInstance(ctx: Context): { getSnapshot: () => ViewSnapshot, subscribe: (fn: () => void) => () => void, store: { update: (fn: (draft: ViewDraft) => void) => void } } | undefined {
+function workspaceViewInstance(ctx: Context): {
+  getSnapshot: () => ViewSnapshot
+  subscribe: (fn: () => void) => () => void
+  store: { update: (fn: (draft: ViewDraft) => void) => void }
+} | undefined {
   let entries
   try {
     entries = ctx.slots.entries(SIDEBAR_SLOT)
@@ -275,11 +134,10 @@ function sameOrder(left: readonly string[] | undefined, right: readonly string[]
  * mode.
  *
  * Manual mode freezes any group that owns a stored order, and DSH hands one to
- * *every* account the moment a blank Session is selected (`syncSessionOrders`
- * writes the current rendered order back for all of them). That is what makes a
+ * *every* account the moment a blank Session is selected. That is what makes a
  * workspace stop re-sorting by recency after the first new Session: the stored
- * order wins from then on. Ungrouped additionally drifts on its own, since every
- * Session either joins it or leaves it.
+ * order wins from then on. Ungrouped additionally drifts on its own, since
+ * every Session either joins it or leaves it.
  *
  * So this writer refreshes an account's stored order whenever it no longer
  * matches the current recency order. Only accounts that already own one are
@@ -289,14 +147,23 @@ function sameOrder(left: readonly string[] | undefined, right: readonly string[]
  *
  * Trade-off: a manual drag on any group is overwritten by the next refresh. That
  * is deliberate — this plugin's position is that groups stay newest-first.
+ *
+ * CAREFUL: this writer must never run against a half-loaded Session list. A
+ * stored order is what the sidebar *renders* under manual mode, so writing the
+ * recency order computed from an empty snapshot replaces every group's members
+ * with `[]` — the sidebar then shows no rows at all until something writes a
+ * real order back. Both snapshots therefore have to look ready, and a non-empty
+ * stored order is never replaced by an empty computed one.
  */
-export function keepRecencyOrder(ctx: Context, pluginName: string): void {
+export function keepRecencyOrder(ctx: Context, pluginName: string, write = true): void {
   ctx.effect(() => {
     let view: ReturnType<typeof workspaceViewInstance>
     let disposed = false
     let disposers: (() => void)[] = []
     let timers: number[] = []
     let warned = false
+    /** Accounts whose order has already been refreshed once on this page. */
+    const writtenAccounts = new Set<string>()
     const sync = (): void => {
       if (disposed || view === undefined) return
       let snapshot: ViewSnapshot
@@ -308,13 +175,38 @@ export function keepRecencyOrder(ctx: Context, pluginName: string): void {
       if (snapshot === undefined || snapshot.orderBy !== 'manual') return
       const stored = snapshot.sessionOrderByAccount
       if (stored === undefined) return
+      let sessions: { phase?: string | undefined, ids?: readonly string[] | undefined } | undefined
+      let workspaces: { phase?: string | undefined } | undefined
+      try {
+        sessions = ctx.sessions.list.getSnapshot() as { phase?: string, ids?: readonly string[] }
+        workspaces = ctx.workspaces.list.getSnapshot() as { phase?: string }
+      } catch {
+        return
+      }
+      // Nothing is knowable before both lists have loaded.
+      if (sessions?.phase !== undefined && sessions.phase !== 'ready') return
+      if (workspaces?.phase !== undefined && workspaces.phase !== 'ready') return
+      if ((sessions?.ids ?? []).length === 0) return
       const changed: Record<string, string[]> = {}
       for (const [account, order] of Object.entries(recencyOrders(ctx))) {
         const current = stored[account]
         if (!Array.isArray(current) || sameOrder(current, order)) continue
+        // Never let a snapshot gap empty out a group that has members recorded.
+        if (order.length === 0 && current.length > 0) continue
+        // One write per account per page: a write that does not converge would
+        // otherwise re-enter through the subscription that triggered it.
+        if (writtenAccounts.has(account)) continue
         changed[account] = order
       }
+      if (Object.keys(changed).length > 0) {
+        for (const account of Object.keys(changed)) writtenAccounts.add(account)
+      }
       if (Object.keys(changed).length === 0) return
+      if (!write) {
+        // Bisection mode: the store was located and read, but nothing is written.
+        console.warn(`${pluginName}: order refresh suppressed (diagnostic), accounts=${Object.keys(changed).length}`)
+        return
+      }
       try {
         view.store.update((draft) => {
           if (draft.sessionOrderByAccount === undefined) draft.sessionOrderByAccount = {}
@@ -370,18 +262,19 @@ export function keepRecencyOrder(ctx: Context, pluginName: string): void {
 }
 
 /**
- * Make an unqualified "new Session" open a projectless one.
+ * Make an unqualified "new Session" start a projectless one.
  *
  * `uiWorkspace.startSession(workspaceId)` falls back to the current Session's
- * Workspace and then to the most recently used Workspace — never to a
- * projectless Session. This wrapper delegates an unqualified call to the
- * picker's own provisioning, while an explicit `workspaceId` (a group's "+")
- * keeps DSH's behaviour.
+ * Workspace and then to the most recently used Workspace — and with nothing to
+ * fall back to it clears the main view rather than creating a Session. This
+ * wrapper delegates an unqualified call to the picker's own provisioning, while
+ * an explicit `workspaceId` (a group's "+") keeps DSH's behaviour.
  */
 export function installDefaultNewSession(
   ctx: Context,
   pluginName: string,
   startProjectless: () => Promise<SessionId>,
+  ready: () => boolean = () => true,
 ): void {
   ctx.effect(() => {
     const ui = ctx.uiWorkspace
@@ -391,6 +284,14 @@ export function installDefaultNewSession(
     const patched = function (this: unknown, workspaceId?: WorkspaceId): unknown {
       if (workspaceId !== undefined) {
         report(ctx, { phase: 'startSession', mode: 'explicit-workspace' })
+        return fallback.call(ui, workspaceId)
+      }
+      // A projectless Session is only usable once the composer gate is in
+      // place: without it the input bar stays inert, and a brand-new Session
+      // nobody can type into is worse than DSH's own behaviour. So the default
+      // is only diverted while the override is actually registered.
+      if (!ready()) {
+        report(ctx, { phase: 'startSession', mode: 'fallback-gate-not-ready' })
         return fallback.call(ui, workspaceId)
       }
       report(ctx, { phase: 'startSession', mode: 'default' })

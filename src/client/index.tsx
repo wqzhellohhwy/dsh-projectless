@@ -1,5 +1,5 @@
 import * as React from 'react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useState } from 'react'
 import type { RefObject } from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
@@ -29,43 +29,52 @@ import {
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   PROJECTLESS_ENTRY_ID,
-  createAbandonClaim,
-  createAndOpenProjectlessSession,
-  createProjectlessRegistry,
-  isProjectlessPath,
-  reclaimUnusedProjectlessWorkspaces,
+  createProjectlessSession,
   requestProjectlessDirectory,
   requestProjectlessRoot,
-  requestRemoveProjectlessDirectory,
-  resolvePickerSelection,
-  sweepLeftoverProjectlessWorkspaces,
-  watchTemporaryWorkspace,
+  workspaceOfSession,
 } from './session.ts'
+import { installComposerGate, type ComposerGateStats } from './composer.ts'
 import { report, type DiagnosticsReply } from './diagnostics.ts'
-import { runDraftSelftest } from './selftest.ts'
+import { runProjectlessSelftest } from './selftest.ts'
 import { PROJECTLESS_LOCALE_NS, projectlessLocales } from './locales.ts'
 import {
   installDefaultNewSession,
   installStyles as installSidebarStyles,
   keepRecencyOrder,
-  markTemporaryGroups,
-  projectlessLabel,
-  reconcileLabel,
   recencyOrders,
-  watchTemporaryLabel,
 } from './sidebar.ts'
 
 const PACKAGE_ID = 'dsh-projectless'
 const VERSION = '1.0.0'
 /** Bumped on every build so a stale page is distinguishable from a fresh one. */
-const BUILD = 3
+const BUILD = 33
 /**
- * Run the draft self-test on every page load. Always false in a build that is
- * meant to be used: the self-test opens and closes real Sessions on screen, so
- * it only runs when the Host hands out the `draft-selftest` command. Set it to
- * true for one build when the command channel itself is what needs testing.
+ * Run the self-test on every page load. Always false in a build that is meant
+ * to be used: the self-test opens and closes real Sessions on screen, so it
+ * only runs when the Host hands out the `projectless-selftest` command.
  */
-const FORCE_DRAFT_SELFTEST = false
+const FORCE_SELFTEST = false
+/**
+ * DIAGNOSTIC BUILD ONLY: observe the sidebar and report it, installing nothing.
+ *
+ * The sidebar renders no groups at all on the affected machine, and this
+ * variant exists to answer one question from outside the page: does a plugin
+ * that only reads state still see an empty sidebar? No stylesheet, no slot
+ * registration, no store write, no override — just a periodic self-report.
+ */
+const PROBE_ONLY = false
+/**
+ * BISECTION SWITCHES, diagnostic build only. The sidebar rendered no groups at
+ * all with every feature installed, so each group is switched on separately to
+ * find which one breaks it. All three are true in a normal build.
+ */
+const ENABLE_UI = true
+const ENABLE_ORDER = true
+const ENABLE_SESSION = true
+/** Bisection: locate the sidebar view store but never write to it. */
+const ENABLE_ORDER_WRITE = true
+const TREE_ROW = '[data-row-key="workspace:"]'
 const PROJECTLESS = PROJECTLESS_ENTRY_ID
 const ADD_WORKSPACE = '::add-workspace'
 const DSH_DIRECTORY_FLOW = 'conversation.hero.workspace.directoryFlow'
@@ -85,7 +94,6 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
 interface PickerActions {
   createWorkspace(input: { path: string }): Promise<WorkspaceView>
   createProjectlessSession(): Promise<SessionId>
-  isProjectlessWorkspace(workspace: WorkspaceView): boolean
   hooks: {
     directoryFlow: HostObservable<boolean>
   }
@@ -112,7 +120,6 @@ function ProjectlessWorkspacePicker({
   useWorkspaces,
   createWorkspace,
   createProjectlessSession,
-  isProjectlessWorkspace,
   useDirectoryFlow,
   renderSlot,
   t,
@@ -126,19 +133,14 @@ function ProjectlessWorkspacePicker({
     [anchorRef],
   )
 
-  const selection = resolvePickerSelection(
-    workspaceState.items,
-    selectedId,
-    isProjectlessWorkspace,
-  )
-  const workspaceItems: MenuEntry[] = selection.projects.map(workspace => ({
+  const workspaceItems: MenuEntry[] = (workspaceState.items ?? []).map((workspace: WorkspaceView) => ({
     id: workspace.workspaceId,
     label: workspace.title,
     icon: <IconFolderCloseRegular size={16} />,
     disabled: busy,
   }))
   const flowAvailable = useDirectoryFlow((occupied: boolean) => occupied)
-  useEffect(() => {
+  React.useEffect(() => {
     if (flowOpen && !flowAvailable) setFlowOpen(false)
   }, [flowOpen, flowAvailable])
   const footer: MenuEntry[] = [
@@ -211,7 +213,7 @@ function ProjectlessWorkspacePicker({
         anchor={null}
         items={workspaceItems}
         footer={footer}
-        selectedId={selection.selectedId}
+        selectedId={selectedId}
         onSelect={handleSelect}
         onClose={onClose}
         side="bottom"
@@ -293,34 +295,16 @@ export const name = PACKAGE_ID
 export const inject = ['connection', 'locale', 'slots', 'sessions', 'workspaces', 'uiWorkspace']
 
 /**
- * DSH 0.2 split the old combined Workspace face: registrations live on
- * `ctx.workspaces`, blank-Session connection, navigation and archival on
- * `ctx.uiWorkspace`.
- */
-function projectlessHost(ctx: Context) {
-  const workspaces = ctx.workspaces
-  const ui: UiWorkspace = ctx.uiWorkspace
-  const sessions = {
-    list: ctx.sessions.list,
-    open: (sessionId: SessionId) => { ui.openSession(sessionId) },
-  }
-  const host = {
-    list: workspaces.list,
-    create: (input: { path: string }) => workspaces.create(input),
-    delete: (workspaceId: WorkspaceId) => workspaces.delete(workspaceId),
-    rename: (workspaceId: WorkspaceId, title: string) => workspaces.rename(workspaceId, title),
-    connectWorkspace: (workspaceId: WorkspaceId) => ui.connectWorkspace(workspaceId),
-    archiveSession: (sessionId: SessionId) => ui.archiveSession(sessionId),
-  }
-  return { host, sessions }
-}
-
-/**
  * Post the Client face's own state to the Host: the only way to tell "the
- * plugin never ran", "it ran but the sidebar store was missing" and "it ran
- * and is enforcing the order" apart from outside the page.
+ * plugin never ran", "it ran but the sidebar store was missing", "it ran and is
+ * enforcing the order" and "the composer gate is open" apart from outside the
+ * page.
  */
-async function selfCheck(ctx: Context, phase: string): Promise<DiagnosticsReply | undefined> {
+async function selfCheck(
+  ctx: Context,
+  phase: string,
+  gate: ComposerGateStats,
+): Promise<DiagnosticsReply | undefined> {
   let orderBy: string | null = null
   let storedAccounts: Record<string, { members: number, outOfRecency: number }> | null = null
   try {
@@ -341,23 +325,27 @@ async function selfCheck(ctx: Context, phase: string): Promise<DiagnosticsReply 
     }
   } catch { /* the sidebar is not mounted yet */ }
   let sidebarSections = -1
-  let taggedTemporarySections = -1
+  let ungroupless = 0
   try {
     sidebarSections = document.querySelectorAll('[role="tree"] > div').length
-    taggedTemporarySections = document.querySelectorAll('[data-dsh-projectless-temp]').length
+    for (const section of document.querySelectorAll('[role="tree"] > div')) {
+      if (section.querySelector(TREE_ROW) !== null) {
+        ungroupless = section.querySelectorAll('[data-row-key^="session:"]').length
+      }
+    }
   } catch { /* no document yet */ }
   const ui = ctx.uiWorkspace
-  let blankCount = 0
-  let blankProjectless = 0
+  let blankWithoutWorkspace = 0
+  let current: SessionId | null = null
+  let currentHasWorkspace = false
   try {
     const sessions = ctx.sessions.list.getSnapshot()
+    const workspaces = ctx.workspaces.list.getSnapshot().items ?? []
+    current = currentSessionId(ctx) ?? null
+    currentHasWorkspace = current === null ? false : workspaceOfSession(workspaces, current) !== undefined
     for (const id of sessions.ids ?? []) {
       if (sessions.byId[id]?.blank !== true) continue
-      blankCount += 1
-    }
-    for (const workspace of ctx.workspaces.list.getSnapshot().items ?? []) {
-      if (!isProjectlessPath(workspace.path)) continue
-      if (workspace.sessionIds.some(id => sessions.byId[id]?.blank === true)) blankProjectless += 1
+      if (workspaceOfSession(workspaces, id) === undefined) blankWithoutWorkspace += 1
     }
   } catch { /* services are going away */ }
   return await report(ctx, {
@@ -367,14 +355,46 @@ async function selfCheck(ctx: Context, phase: string): Promise<DiagnosticsReply 
     url: String((typeof location === 'undefined' ? undefined : location.href) ?? ''),
     wrapperInstalled: typeof ui?.startSession === 'function'
       && (ui.startSession as { __dshProjectless?: boolean }).__dshProjectless === true,
-    label: projectlessLabel(ctx) ?? null,
+    composerChain: (() => {
+      try {
+        const entries = [...(ctx.slots.entries('conversation.composer' as never) ?? [])]
+        if (entries.length === 0) return '(none)'
+        const nameOf = (component: unknown): string => {
+          if (typeof component === 'function') return (component as { name?: string }).name ?? 'fn'
+          if (typeof component === 'object' && component !== null) {
+            const shape = component as { displayName?: string, type?: { name?: string } }
+            return shape.displayName ?? shape.type?.name ?? 'obj'
+          }
+          return typeof component
+        }
+        return entries.map((entry) => {
+          const options = (entry as { options?: { name?: unknown, priority?: unknown, inject?: unknown } }).options
+          const hasInject = options?.inject !== undefined ? 'i' : '-'
+          return `${nameOf((entry as { component?: unknown }).component)}#${String(options?.priority ?? '-')}${hasInject}`
+        }).join(',')
+      } catch (reason) {
+        return `err:${String(reason).slice(0, 60)}`
+      }
+    })(),
+    composerGate: { borrowed: gate.borrowed, opened: gate.opened, rendered: gate.rendered, syncs: gate.syncs, entriesSeen: gate.entriesSeen, registered: gate.registered, lastError: gate.lastError, probe: gate.probe },
     orderBy,
     storedAccounts,
     sidebarSections,
-    taggedTemporarySections,
-    blankCount,
-    blankProjectless,
+    ungrouplessSessions: ungroupless,
+    blankWithoutWorkspace,
+    current,
+    currentHasWorkspace,
   })
+}
+
+/** The Session the main view currently retains. */
+function currentSessionId(ctx: Context): SessionId | undefined {
+  try {
+    const sessions = ctx.sessions.list.getSnapshot()
+    return (sessions.ids ?? []).find((id: string) => (sessions.byId[id]?.retainedBy?.mainView ?? 0) > 0)
+  } catch {
+    return undefined
+  }
 }
 
 /** The sidebar view store, or undefined while it is not registered. */
@@ -399,149 +419,148 @@ function sidebarViewFor(ctx: Context): {
 /** Install the picker; DSH's built-in priority 0 picker remains the fallback. */
 export function apply(ctx: Context): void {
   console.info(`${PACKAGE_ID}: client face applied`)
-  const { host, sessions } = projectlessHost(ctx)
-  const registry = createProjectlessRegistry()
-  const pendingWorkspaceIds = new Set<WorkspaceId>()
-  const claim = createAbandonClaim()
+  const ui: UiWorkspace = ctx.uiWorkspace
   const rpc = ctx.connection.rpc as unknown as ClientConnectionRpc
-  const removeDirectory = (path: string) => requestRemoveProjectlessDirectory(rpc, path)
-  const isProjectlessWorkspace = (workspace: WorkspaceView): boolean => (
-    registry.has(workspace.workspaceId) || isProjectlessPath(workspace.path)
-  )
+  const gate: ComposerGateStats = { opened: 0, borrowed: false, rendered: 0, syncs: 0, entriesSeen: -1, registered: false, lastError: null, probe: null }
   let rootPromise: Promise<string> | undefined
   const projectlessRoot = (): Promise<string> => (rootPromise ??= requestProjectlessRoot(rpc))
 
+  /** Projectless Sessions this page started; pruned as they stop qualifying. */
+  const orphanSessions = new Set<SessionId>()
+
+  /**
+   * The tracked Sessions that are still blank and still belong to no Workspace.
+   * A Session that has been sent to, deleted, or claimed by a Workspace drops
+   * out for good, so the composer gate only ever opens for a Session that can
+   * actually accept the prompt.
+   */
+  const liveOrphans = (): SessionId[] => {
+    const live: SessionId[] = []
+    let sessions
+    let workspaces: readonly WorkspaceView[] = []
+    try {
+      sessions = ctx.sessions.list.getSnapshot()
+      workspaces = ctx.workspaces.list.getSnapshot().items ?? []
+    } catch {
+      return live
+    }
+    for (const id of [...orphanSessions]) {
+      const row = sessions.byId[id]
+      if (row === undefined || row.blank !== true || workspaceOfSession(workspaces, id) !== undefined) {
+        orphanSessions.delete(id)
+        continue
+      }
+      live.push(id)
+    }
+    return live
+  }
+
+  const startProjectlessSession = async (): Promise<SessionId> => {
+    const receipt = await createProjectlessSession({
+      sessions: ctx.sessions as never,
+      openSession: sessionId => { ui.openSession(sessionId) },
+      provisionDirectory: () => requestProjectlessDirectory(rpc),
+    })
+    orphanSessions.add(receipt.sessionId)
+    report(ctx, { phase: 'created', sessionId: receipt.sessionId, cwd: receipt.cwd, orphans: orphanSessions.size })
+    return receipt.sessionId
+  }
+
+  // A steady self-report runs in every mode, so a bisection step is observable
+  // from outside the page without anyone having to look at the screen.
+  report(ctx, { phase: 'probe-attached', build: BUILD, ui: ENABLE_UI, order: ENABLE_ORDER, session: ENABLE_SESSION })
+  window.setTimeout(() => { void selfCheck(ctx, 'probe', gate) }, 3000)
+  const ticker = window.setInterval(() => { void selfCheck(ctx, 'tick', gate) }, 8000)
+  ctx.effect(() => () => { window.clearInterval(ticker) }, `${PACKAGE_ID}: probe ticker`)
+  if (PROBE_ONLY) return
+  if (!ENABLE_UI && !ENABLE_ORDER && !ENABLE_SESSION) return
+
   ctx.effect(installPickerCss, `${PACKAGE_ID}: picker styles`)
+  if (ENABLE_UI) installSidebarStyles(ctx, PACKAGE_ID)
   ctx.effect(
     () => ctx.locale.register(PROJECTLESS_LOCALE_NS, projectlessLocales),
     `${PACKAGE_ID}: dictionaries`,
   )
-
-  const directoryFlow: HostObservable<boolean> = {
-    getSnapshot: () => ctx.slots.entries(DIRECTORY_FLOW).length > 0,
-    subscribe: (listener: () => void) => ctx.slots.subscribe(DIRECTORY_FLOW, listener),
-  }
-
-  /**
-   * Reclaim the blank projectless Workspaces this page created earlier, so the
-   * sidebar keeps a single "Session without workspace" group. Deferred, because
-   * the Session that was just opened has to be the current one before its
-   * predecessor counts as unused.
-   */
-  const scheduleReclaim = (): void => {
-    window.setTimeout(() => {
-      void projectlessRoot().then((root) => {
-        reclaimUnusedProjectlessWorkspaces(
-          host,
-          sessions,
-          root,
-          removeDirectory,
-          registry,
-          pendingWorkspaceIds,
-          claim,
-        )
-      }).catch(() => {})
-    }, 1200)
-  }
-
-  const createProjectlessSession = async (): Promise<SessionId> => {
-    const label = projectlessLabel(ctx)
-    // Start the rename watcher before provisioning: it wins the race against
-    // the Workspace list refresh that follows creation.
-    const stopLabelWatch = watchTemporaryLabel(ctx, label)
-    let receipt
-    try {
-      receipt = await createAndOpenProjectlessSession(
-        host,
-        sessions,
-        () => requestProjectlessDirectory(rpc),
-        registry,
-        removeDirectory,
-        pendingWorkspaceIds,
-      )
-    } finally {
-      window.setTimeout(stopLabelWatch, 2000)
-    }
-    if (label !== undefined) await host.rename(receipt.workspaceId, label).catch(() => {})
-    ctx.effect(
-      () => {
-        const stop = watchTemporaryWorkspace(host, sessions, receipt)
-        pendingWorkspaceIds.delete(receipt.workspaceId)
-        return stop
-      },
-      `${PACKAGE_ID}: watch ${receipt.sessionId} temporary workspace`,
-    )
-    reconcileLabel(ctx, receipt.sessionId, label)
-    scheduleReclaim()
-    return receipt.sessionId
-  }
-
-  // A blank Session left behind by a previous DSH run is reclaimed on startup;
-  // one the user simply clicked away from is kept, draft and all.
-  ctx.effect(() => {
-    let disposed = false
-    let stopSweep = (): void => {}
-    void projectlessRoot().then((root) => {
-      if (disposed) return
-      stopSweep = sweepLeftoverProjectlessWorkspaces(
-        host,
-        sessions,
-        root,
-        removeDirectory,
-        registry,
-        pendingWorkspaceIds,
-        claim,
-        projectlessLabel(ctx),
-      )
-    }).catch(console.error)
-    return () => {
-      disposed = true
-      stopSweep()
-    }
-  }, `${PACKAGE_ID}: sweep leftover blank workspaces`)
-
-  installSidebarStyles(ctx, PACKAGE_ID)
-  markTemporaryGroups(ctx, PACKAGE_ID)
-  keepRecencyOrder(ctx, PACKAGE_ID)
-  installDefaultNewSession(ctx, PACKAGE_ID, createProjectlessSession)
-
-  const actions = (): PickerActions => ({
-    createWorkspace: input => host.create(input),
-    isProjectlessWorkspace,
-    hooks: { directoryFlow },
-    createProjectlessSession,
-  })
-
-  ctx.slots.inject('conversation.hero.workspace', () => ctx.slots.register(
-    {
-      name: 'conversation.hero.workspace',
-      priority: -1,
-      children: {
-        [DIRECTORY_FLOW]: { kind: 'single', scope: 'root' },
-      },
-      inject: actions,
-      locale: PROJECTLESS_LOCALE_NS,
+  if (ENABLE_ORDER) keepRecencyOrder(ctx, PACKAGE_ID, ENABLE_ORDER_WRITE)
+  if (ENABLE_SESSION) installDefaultNewSession(ctx, PACKAGE_ID, startProjectlessSession, () => gate.registered)
+  if (ENABLE_SESSION) installComposerGate(ctx, PACKAGE_ID, {
+    liveOrphans,
+    currentSessionId: () => currentSessionId(ctx),
+    cwdOf: (sessionId) => {
+      try {
+        return ctx.sessions.list.getSnapshot().byId[sessionId]?.cwd
+      } catch {
+        return undefined
+      }
     },
-    ProjectlessWorkspacePicker,
-  ))
-  ctx.slots.inject(DIRECTORY_FLOW, () => mirrorDirectoryFlow(ctx.slots))
+    hasWorkspace: (sessionId) => {
+      try {
+        return workspaceOfSession(ctx.workspaces.list.getSnapshot().items ?? [], sessionId) !== undefined
+      } catch {
+        return true
+      }
+    },
+  }, gate)
 
-  // The Host answers each report with any queued command; `draft-selftest` is
-  // the only one, and it costs a real Session round trip, so it never runs
+  if (ENABLE_UI) {
+    const directoryFlow: HostObservable<boolean> = {
+      getSnapshot: () => ctx.slots.entries(DIRECTORY_FLOW).length > 0,
+      subscribe: (listener: () => void) => ctx.slots.subscribe(DIRECTORY_FLOW, listener),
+    }
+
+    const actions = (): PickerActions => ({
+      createWorkspace: input => ctx.workspaces.create(input),
+      hooks: { directoryFlow },
+      createProjectlessSession: startProjectlessSession,
+    })
+
+    ctx.slots.inject('conversation.hero.workspace', () => ctx.slots.register(
+      {
+        name: 'conversation.hero.workspace',
+        priority: -1,
+        children: {
+          [DIRECTORY_FLOW]: { kind: 'single', scope: 'root' },
+        },
+        inject: actions,
+        locale: PROJECTLESS_LOCALE_NS,
+      },
+      ProjectlessWorkspacePicker,
+    ))
+    ctx.slots.inject(DIRECTORY_FLOW, () => mirrorDirectoryFlow(ctx.slots))
+  }
+
+  // The Host answers each report with any queued command; `projectless-selftest`
+  // is the only one, and it costs a real Session round trip, so it never runs
   // unless somebody asked for it from outside the page.
   window.setTimeout(() => {
-    void selfCheck(ctx, 'applied').then((reply) => {
-      if (!FORCE_DRAFT_SELFTEST && !(reply?.commands ?? []).includes('draft-selftest')) return
-      void runDraftSelftest(ctx, {
-        createProjectlessSession,
-        openSession: sessionId => { ctx.uiWorkspace.openSession(sessionId) },
-        snapshot: () => {
-          const sessions = ctx.sessions.list.getSnapshot()
-          const current = (sessions.ids ?? []).find((id: string) => (sessions.byId[id]?.retainedBy?.mainView ?? 0) > 0)
-          return { current, blank: (id: SessionId) => sessions.byId[id]?.blank }
+    void selfCheck(ctx, 'applied', gate).then((reply) => {
+      if (!FORCE_SELFTEST && !(reply?.commands ?? []).includes('projectless-selftest')) return
+      void runProjectlessSelftest(ctx, {
+        startProjectlessSession,
+        openSession: sessionId => { ui.openSession(sessionId) },
+        currentSessionId: () => currentSessionId(ctx),
+        cwdOf: (sessionId) => {
+          try {
+            return ctx.sessions.list.getSnapshot().byId[sessionId]?.cwd
+          } catch {
+            return undefined
+          }
         },
-        hasProjectlessWorkspace: sessionId => (ctx.workspaces.list.getSnapshot().items ?? [])
-          .some(workspace => isProjectlessPath(workspace.path) && workspace.sessionIds.includes(sessionId)),
+        hasWorkspace: (sessionId) => {
+          try {
+            return workspaceOfSession(ctx.workspaces.list.getSnapshot().items ?? [], sessionId) !== undefined
+          } catch {
+            return true
+          }
+        },
+        blank: (sessionId) => {
+          try {
+            return ctx.sessions.list.getSnapshot().byId[sessionId]?.blank
+          } catch {
+            return undefined
+          }
+        },
+        root: projectlessRoot,
       })
     })
   }, 2500)

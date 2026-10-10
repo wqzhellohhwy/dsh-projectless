@@ -193,14 +193,47 @@ macOS/Linux 为系统临时目录）：
 
 ---
 
-## 八、已知取舍
+## 八、让「无工作区会话」立刻能打字（可选的 DSH 侧补丁）
+
+**「点新会话 → 直接落在未分组」这半边插件自己就能做到**：会话经
+`sessions.create({ cwd })` 建立，**不注册任何工作区**，因此它天然属于未分组，
+侧边栏也不会多出一个分组，更不存在「建了再拆」和回收。
+
+但**空白**的无工作区会话能不能马上打字，取决于 DSH 本体里的一处判定：
+
+```js
+const inert = sessionId === void 0 || (hero && chipTitle === void 0);
+// chipTitle 只认「会话属于哪个工作区」，从 cwd 兜底的那条路被
+// `workspaces.phase === "ready"` 短路掉了
+```
+
+于是无工作区的空白会话必然被禁用输入框（只显示「选择一个工作区开始」）。
+**这一处插件无法旁路** —— 插槽链、`hero`、草稿、虚拟归属都验证过改不动它，
+证据与失败路径见 [`tools/dsh-composer-gate/README.md`](tools/dsh-composer-gate/README.md)。
+
+想要「新会话落未分组 + 立刻能打字」，就给 DSH 本体打 **5 个字符**的补丁
+（`"ready"` → `"readx"`，等长替换、可一键还原）：
+
+```bash
+node tools/dsh-composer-gate/asar-patch.mjs backup  "<DSH>/resources/app.asar"
+node tools/dsh-composer-gate/asar-patch.mjs find    "<DSH>/resources/app.asar" \
+     "dsh-client-ui-conversation\lib\client.js" 'workspaces.phase === "ready"'
+node tools/dsh-composer-gate/asar-patch.mjs splice  "<DSH>/resources/app.asar" <数据区偏移+22> "ready" "readx"
+```
+
+**不打这个补丁也完全能用**：插件会自动退回 DSH 原生行为（新会话落在当前/最近的工作区），
+不会造出「落了未分组却打不了字」的空会话。升级 DSH 会覆盖补丁，需要按上述步骤重打。
+
+---
+
+## 九、已知取舍
 
 1. **手动拖拽的顺序会被覆盖**。本插件的立场是各分组永远「最新在上」，
    下一次顺序刷新会写回时间序。
-2. **同时只保留一个空白无工作区会话**：再新建一个时，上一个空白会话会被回收
-   （连同它的草稿）。这与原生工作区略有不同，但能保证侧边栏不会堆出多个
-   同名分组。
-3. **重启会清扫上一次运行遗留的空白无工作区会话**，其草稿也就到此为止。
+2. **空白无工作区会话立刻能打字，依赖上面那处 DSH 侧补丁**；没打补丁时
+   「新会话」走 DSH 原生路径。
+3. **无工作区会话没有「载体工作区」**：插件不创建临时工作区，也没有回收逻辑 ——
+   会话一直留在未分组里，草稿跟着会话走。
 4. 「单一列表」视图不参与顺序维护。
 
 ---

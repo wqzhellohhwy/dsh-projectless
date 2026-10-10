@@ -1,6 +1,6 @@
 {
   "name": "dsh-projectless",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "DeepSeek Harness plugin: Session without workspace, with a recency-ordered sidebar and draft-safe blank Sessions",
   "keywords": [
     "deepseek",
