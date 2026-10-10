@@ -1,4 +1,5 @@
 import { appendFile, readFile } from 'node:fs/promises'
+import { detectPatchStatus } from './host/patches.ts'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
@@ -33,6 +34,12 @@ export interface Config {
   diagnostics?: boolean
   /** Override the diagnostics file; defaults to `%TEMP%/dsh-projectless-diagnostics.json`. */
   diagnosticsFile?: string
+  /**
+   * Inspect the application archive for the two DSH-side patches on every Host
+   * start and record the result in the diagnostics log. Defaults to enabled;
+   * set `false` to skip the (one-off, ~100 MB) read.
+   */
+  patchCheck?: boolean
   /**
    * Override the command file the Client face reads back on each report.
    * Writing `{ "commands": ["draft-selftest"] }` there makes the next page
@@ -195,6 +202,23 @@ export function apply(ctx: Context, config: Config = {}): void {
   if (config.diagnostics === false) return
   const file = config.diagnosticsFile ?? join(tmpdir(), 'dsh-projectless-diagnostics.json')
   const commandsFile = config.commandsFile ?? join(tmpdir(), 'dsh-projectless-commands.json')
+  // Patch self-check, written once per Host start: the two DSH-side patches live
+  // in the application archive, so "composer still inert" and "patch missing"
+  // are indistinguishable from the UI alone.
+  if (config.patchCheck !== false) {
+    ctx.effect(() => {
+      void detectPatchStatus().then((status) => {
+        const line = JSON.stringify({
+          receivedAt: new Date().toISOString(),
+          payload: { phase: 'patch-check', plugin: name, ...status },
+        })
+        return appendFile(file, `${line}\n`, 'utf8').then(() => {
+          if (!status.composerGate || !status.composerChip) console.warn(`${name}: ${status.summary}`)
+        })
+      }).catch(() => {})
+      return () => {}
+    }, `${name}: patch self-check`)
+  }
   const path = `${PROJECTLESS_RPC_CHANNEL}/${diagnosticsEndpoint()}`
   ctx.effect(() => ctx.connection.fetch.register({
     path,

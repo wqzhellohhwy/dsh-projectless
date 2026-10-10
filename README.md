@@ -44,19 +44,33 @@ DSH 原生只能在工作区里新建会话。本插件补上四件事：
 
 ## 二、安装
 
-从 GitHub 源码装：
+> ### ⚠️ 装完插件不等于装完
+>
+> **装插件只是第一步。** 本插件有两个效果必须由**DSH 本体**配合才能生效：
+> 「空白新会话能直接打字」和「hero 标签显示未分组」。这两处都在 DSH 的
+> `app.asar` 里，任何插件都无法在运行时改它们（原因见
+> [第八节](#八为什么需要给-dsh-本体打补丁)）。
+>
+> 所以完整安装 = **装插件 + 打两处补丁 + 重启**。只装插件也不会坏 ——
+> 插件会自动退回 DSH 原生行为（新会话落在当前/最近的工作区），只是少了这两个效果。
+
+### 第 1 步：装插件
+
+从 GitHub 源码装（注意：**补丁脚本不在 npm 包里**，需要克隆整个仓库才有）：
 
 ```bash
-dsh plugin --profile <你的 profile> add github:<你的账号>/dsh-projectless
+git clone https://github.com/wqzhellohhwy/dsh-projectless
+dsh plugin --profile <你的 profile> add /path/to/dsh-projectless
 ```
 
-从本地目录装（开发时常用）：
+或者直接从仓库安装：
 
 ```bash
-dsh plugin --profile <你的 profile> add C:/path/to/dsh-projectless
+dsh plugin --profile <你的 profile> add github:wqzhellohhwy/dsh-projectless
+# ⚠️ 这条装不到补丁脚本，补丁需要另外克隆仓库（见第 2 步）
 ```
 
-装完重启正在跑的 `dsh`。卸载：
+卸载：
 
 ```bash
 dsh plugin --profile <你的 profile> remove dsh-projectless
@@ -64,6 +78,61 @@ dsh plugin --profile <你的 profile> remove dsh-projectless
 
 > 包内已声明 `dsh.bundle.patch`，所以重启后由 profile 的 bundles 自动装配；
 > 运行时热注入（`loader.create`）与重启装配两条路径一致。
+
+### 第 2 步：给 DSH 本体打两处补丁
+
+在**克隆下来的仓库**里执行（脚本会自动探测 DSH 安装位置，Windows / macOS / Linux 都适用）：
+
+```bash
+node tools/dsh-composer-gate/install-patches.mjs
+```
+
+它会：找 `app.asar` → 备份成 `app.asar.bak-projectless` → 打两处**等长字节替换** → 逐处回读校验。
+任何一步对不上（找不到锚点、出现多次、字节不符）都会**停止并在必要时整体回滚**，不会留下半截状态。
+
+找不到安装位置时显式指定：
+
+```bash
+node tools/dsh-composer-gate/install-patches.mjs --asar "/path/to/resources/app.asar"
+```
+
+**只检查不改动**：
+
+```bash
+node tools/dsh-composer-gate/install-patches.mjs --check
+```
+
+**一键还原**（升级 DSH 后如果不想再打，或想彻底恢复原样）：
+
+```bash
+node tools/dsh-composer-gate/install-patches.mjs --restore
+```
+
+### 第 3 步：完全退出 DSH 再打开
+
+补丁在**启动时**读入内存，**刷新页面不够**，必须退出进程重开。
+
+### 第 4 步：确认
+
+```bash
+node tools/dsh-composer-gate/install-patches.mjs --check
+# [✓] composer-gate: 已打
+# [✓] composer-chip: 已打
+# 结论：两处补丁都已生效。
+```
+
+插件自己也会检查：每次 DSH 启动时把结果写进诊断日志（`%TEMP%/dsh-projectless-diagnostics.json`，
+见[第七节](#七诊断与自检)），字段是 `phase: "patch-check"`：
+
+```json
+{"phase":"patch-check","readable":true,"composerGate":true,"composerChip":true,
+ "summary":"两处补丁均已生效"}
+```
+
+### ⚠️ 升级 DSH 之后
+
+DSH 升级会**覆盖 `app.asar`，补丁随之丢失**。升级后重新执行第 2 步即可（脚本是幂等的，
+已打过的会跳过）。补丁丢失期间插件照常工作，只是那两个效果消失。
 
 ---
 
@@ -204,13 +273,15 @@ macOS/Linux 为系统临时目录）：
 
 ---
 
-## 八、让「无工作区会话」立刻能打字（可选的 DSH 侧补丁）
+## 八、为什么需要给 DSH 本体打补丁
 
 **「点新会话 → 直接落在未分组」这半边插件自己就能做到**：会话经
 `sessions.create({ cwd })` 建立，**不注册任何工作区**，因此它天然属于未分组，
 侧边栏也不会多出一个分组，更不存在「建了再拆」和回收。
 
-但**空白**的无工作区会话能不能马上打字，取决于 DSH 本体里的一处判定：
+需要补丁的是另外两件事，它们都在 DSH 本体里：
+
+### 1. 空白新会话的输入框被禁用
 
 ```js
 const inert = sessionId === void 0 || (hero && chipTitle === void 0);
@@ -218,23 +289,39 @@ const inert = sessionId === void 0 || (hero && chipTitle === void 0);
 // `workspaces.phase === "ready"` 短路掉了
 ```
 
-于是无工作区的空白会话必然被禁用输入框（只显示「选择一个工作区开始」）。
-**这一处插件无法旁路** —— 插槽链、`hero`、草稿、虚拟归属都验证过改不动它，
+无工作区的空白会话因此**必然**被禁用输入框（只显示「选择一个工作区开始」）。
+**这一处插件无法旁路** —— 插槽链、`hero`、草稿、虚拟归属、外壳状态都逐一验证过，改不动它，
 证据与失败路径见 [`tools/dsh-composer-gate/README.md`](tools/dsh-composer-gate/README.md)。
 
-想要「新会话落未分组 + 立刻能打字」，就给 DSH 本体打 **5 个字符**的补丁
-（`"ready"` → `"readx"`，等长替换、可一键还原）：
+### 2. hero 的工作区标签显示目录名
+
+`dsh-client-ui-conversation` 用 `workspaceLabel(cwd)`（即目录的 basename）当标签，
+而本插件给每个对话一个独立目录，标签就会显示成 `session-08-54-15-xxxx`。
+（有意思的是 DSH 自己的另一个包里，同名函数**有**「未分组」分支，注释称之
+`empty ungrouped marker` —— 这条路径漏了。）
+
+### 补丁做了什么
+
+两处都是**等长字节替换**，不改变文件长度、不重打包：
+
+| 补丁 | 替换 | 效果 |
+| --- | --- | --- |
+| `composer-gate` | `workspaces.phase === "ready"` → `"readx"` | 该比较恒假、短路失效，判定回落到 `cwd`，输入框可用 |
+| `composer-chip` | `workspaceLabel(cwd)` → `"未分组        "` | hero 标签固定显示「未分组」 |
+
+安装与还原见[第二节第 2 步](#第-2-步给-dsh-本体打两处补丁)：
 
 ```bash
-node tools/dsh-composer-gate/asar-patch.mjs backup  "<DSH>/resources/app.asar"
-node tools/dsh-composer-gate/asar-patch.mjs find    "<DSH>/resources/app.asar" \
-     "dsh-client-ui-conversation\lib\client.js" 'workspaces.phase === "ready"'
-node tools/dsh-composer-gate/asar-patch.mjs splice  "<DSH>/resources/app.asar" <数据区偏移+22> "ready" "readx"
-node tools/dsh-composer-gate/patch-composer-chip.mjs "<DSH>/resources/app.asar"
+node tools/dsh-composer-gate/install-patches.mjs            # 打补丁
+node tools/dsh-composer-gate/install-patches.mjs --check    # 只检查
+node tools/dsh-composer-gate/install-patches.mjs --restore  # 还原
 ```
 
-**不打这个补丁也完全能用**：插件会自动退回 DSH 原生行为（新会话落在当前/最近的工作区），
-不会造出「落了未分组却打不了字」的空会话。升级 DSH 会覆盖补丁，需要按上述步骤重打。
+脚本按**锚点**定位（不依赖版本相关的偏移），锚点取得比被替换的文本更靠前，
+所以同一套判定既能识别「未打」也能识别「已打」；任一处对不上就整体不写、必要时回滚。
+
+**不打补丁也完全能用**：插件会自动退回 DSH 原生行为（新会话落在当前/最近的工作区），
+不会造出「落了未分组却打不了字」的空会话。**升级 DSH 会覆盖补丁**，重跑一次第 2 步即可。
 
 ---
 
