@@ -186,13 +186,40 @@ export async function runProjectlessSelftest(
       ungrouplessRows: ungrouplessRows(),
       dom: domProbe(),
     }
+    // Reuse check: a second "new Session" must reopen the same Session — not
+    // create a fresh one on a fresh directory.
+    const second = await deps.startProjectlessSession()
+    await wait(1200)
+    result.reuse = {
+      sessionId: String(second),
+      sameSession: second === target,
+      cwd: deps.cwdOf(second) ?? null,
+      sections: sidebarSections(),
+      ungrouplessRows: ungrouplessRows(),
+    }
+
     const composer = findComposer()
     result.composer = describeComposer(composer)
     if (composer !== undefined) {
+      // Draft survival across "new Session": type, click away, click new
+      // Session again, come back — the text has to still be there.
       result.typed = typeInto(composer, PROMPT)
       await wait(900)
       result.draftAfterTyping = readDraft(target)
-      result.enterPressed = pressEnter(composer)
+      if (startedFrom !== undefined) deps.openSession(startedFrom)
+      await wait(1400)
+      const third = await deps.startProjectlessSession()
+      await wait(1400)
+      const returnedComposer = findComposer()
+      result.draftKept = {
+        sameSession: third === target,
+        draft: readDraft(target),
+        composerText: composerText(returnedComposer).slice(0, 80),
+        sections: sidebarSections(),
+      }
+
+      const sendTarget = returnedComposer ?? findComposer()
+      result.enterPressed = sendTarget === undefined ? false : pressEnter(sendTarget)
       await wait(6000)
       result.afterSend = {
         blank: deps.blank(target) ?? null,

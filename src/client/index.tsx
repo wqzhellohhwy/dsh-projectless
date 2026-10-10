@@ -30,7 +30,7 @@ import {
 import {
   PROJECTLESS_ENTRY_ID,
   createProjectlessSession,
-  requestProjectlessDirectory,
+  requestGroupDirectory,
   requestProjectlessRoot,
   workspaceOfSession,
 } from './session.ts'
@@ -48,7 +48,7 @@ import {
 const PACKAGE_ID = 'dsh-projectless'
 const VERSION = '1.0.0'
 /** Bumped on every build so a stale page is distinguishable from a fresh one. */
-const BUILD = 33
+const BUILD = 37
 /**
  * Run the self-test on every page load. Always false in a build that is meant
  * to be used: the self-test opens and closes real Sessions on screen, so it
@@ -455,14 +455,51 @@ export function apply(ctx: Context): void {
     return live
   }
 
+  /**
+   * The name of the shared projectless working directory — DSH's own word for
+   * the plain-Session bucket. DSH prints a directory's basename on the hero's
+   * workspace chip, so this is what that chip ends up reading.
+   */
+  const groupLabel = (): string => {
+    try {
+      const label = ctx.locale.bind(PROJECTLESS_LOCALE_NS)('group.ungrouped')
+      if (typeof label === 'string' && label !== '') return label
+    } catch { /* dictionary not registered yet */ }
+    return 'Ungrouped'
+  }
+
+  const hasWorkspace = (sessionId: SessionId): boolean => {
+    try {
+      return workspaceOfSession(ctx.workspaces.list.getSnapshot().items ?? [], sessionId) !== undefined
+    } catch {
+      return true
+    }
+  }
+
   const startProjectlessSession = async (): Promise<SessionId> => {
     const receipt = await createProjectlessSession({
       sessions: ctx.sessions as never,
       openSession: sessionId => { ui.openSession(sessionId) },
-      provisionDirectory: () => requestProjectlessDirectory(rpc),
+      ensureGroupDirectory: () => requestGroupDirectory(rpc, groupLabel()),
+      listSessions: () => {
+        const snapshot = ctx.sessions.list.getSnapshot()
+        return {
+          ids: snapshot.ids ?? [],
+          isBlank: (id: SessionId) => snapshot.byId[id]?.blank,
+          cwdOf: (id: SessionId) => snapshot.byId[id]?.cwd,
+        }
+      },
+      hasWorkspace,
     })
     orphanSessions.add(receipt.sessionId)
-    report(ctx, { phase: 'created', sessionId: receipt.sessionId, cwd: receipt.cwd, orphans: orphanSessions.size })
+    report(ctx, {
+      phase: 'created',
+      sessionId: receipt.sessionId,
+      cwd: receipt.cwd,
+      reused: receipt.reused,
+      label: groupLabel(),
+      orphans: orphanSessions.size,
+    })
     return receipt.sessionId
   }
 

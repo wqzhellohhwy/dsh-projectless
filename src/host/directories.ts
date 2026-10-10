@@ -46,6 +46,34 @@ function isErrno(reason: unknown, code: string): boolean {
     && (reason as { code: unknown }).code === code
 }
 
+/**
+ * Ensure ROOT/<name> exists and return its absolute path.
+ *
+ * This is the working directory every projectless Session shares. A Session
+ * needs *a* `cwd` — the Host routes prompts with it and tools resolve relative
+ * paths against it — but it does not need a directory of its own. Creating one
+ * per Session is also what put a `session-…` basename on the hero's workspace
+ * chip; with a single, stably named directory that chip simply reads
+ * "未分组" / "Ungrouped".
+ *
+ * `name` must be a plain directory name: no separators, no drive letters, no
+ * `.`/`..`, so the endpoint cannot be talked into creating anything outside the
+ * configured root.
+ */
+export async function ensureGroupDirectory(root: string, name: string): Promise<string> {
+  if (!isAbsolute(root)) throw new Error('projectless session root must be an absolute path')
+  if (name === '' || name === '.' || name === '..') {
+    throw new Error('projectless group name must be a plain directory name')
+  }
+  if (name.includes('/') || name.includes('\\') || name.includes(':')) {
+    throw new Error('projectless group name must be a plain directory name')
+  }
+  const resolvedRoot = await resolveProjectlessRoot(root)
+  const target = join(resolvedRoot, name)
+  await mkdir(target, { recursive: true, mode: 0o700 })
+  return target
+}
+
 /** Prefer the Host-resolved root so Workspace realpaths still match. */
 export async function resolveProjectlessRoot(root: string): Promise<string> {
   if (!isAbsolute(root)) throw new Error('projectless session root must be an absolute path')

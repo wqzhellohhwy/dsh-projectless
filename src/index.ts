@@ -5,6 +5,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-connection'
 import {
   createProjectlessDirectory,
+  ensureGroupDirectory,
   removeUnusedProjectlessDirectory,
   resolveProjectlessRoot,
 } from './host/directories.ts'
@@ -51,6 +52,12 @@ function pathPayload(payload: unknown): string | undefined {
   return typeof path === 'string' ? path : undefined
 }
 
+function namePayload(payload: unknown): string | undefined {
+  if (typeof payload !== 'object' || payload === null) return undefined
+  const name = (payload as { name?: unknown }).name
+  return typeof name === 'string' ? name : undefined
+}
+
 function badRequest(message: string): RpcResult {
   return {
     ok: false,
@@ -85,6 +92,11 @@ export async function dispatchProjectlessEndpoint(
     }
     if (endpoint === 'get-root') {
       return { ok: true, value: { root: await resolveProjectlessRoot(root) } }
+    }
+    if (endpoint === 'ensure-group-directory') {
+      const name = namePayload(payload)
+      if (name === undefined) return badRequest('ensure-group-directory requires { name }')
+      return { ok: true, value: { path: await ensureGroupDirectory(root, name) } }
     }
     const path = pathPayload(payload)
     if (path === undefined) return badRequest('remove-directory requires { path }')

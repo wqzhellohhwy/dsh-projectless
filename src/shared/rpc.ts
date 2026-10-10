@@ -6,7 +6,12 @@
  */
 export const PROJECTLESS_RPC_CHANNEL = '/api'
 export const PROJECTLESS_RPC_PREFIX = 'projectless'
-export const PROJECTLESS_ENDPOINTS = ['create-directory', 'get-root', 'remove-directory'] as const
+export const PROJECTLESS_ENDPOINTS = [
+  'create-directory',
+  'ensure-group-directory',
+  'get-root',
+  'remove-directory',
+] as const
 export type ProjectlessEndpoint = typeof PROJECTLESS_ENDPOINTS[number]
 
 /** Diagnostics endpoint: an opt-out JSONL trace of what the Client face did. */
