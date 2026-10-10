@@ -227,6 +227,19 @@ export async function runProjectlessSelftest(
         composerText: composerText(findComposer()).slice(0, 80),
         alert: visibleAlert(),
       }
+
+      // Once the conversation has actually started, the next "new Session" must
+      // be a genuinely new one — its own Session *and* its own directory.
+      const next = await deps.startProjectlessSession()
+      await wait(1800)
+      result.nextAfterSend = {
+        sessionId: String(next),
+        isNewSession: next !== target,
+        cwd: deps.cwdOf(next) ?? null,
+        previousCwd: deps.cwdOf(target) ?? null,
+        hasOwnDirectory: deps.cwdOf(next) !== undefined && deps.cwdOf(next) !== deps.cwdOf(target),
+        sections: sidebarSections(),
+      }
     }
     if (startedFrom !== undefined) deps.openSession(startedFrom)
     await wait(1600)

@@ -83,20 +83,23 @@ if (command === 'probe') {
   }
   if (hits === 0) console.log('未命中')
 } else if (command === 'splice') {
+  // 按 UTF-8 字节比对与写入：补丁可能包含中文（例如把标签换成「未分组」），
+  // 逐字符比较会在多字节字符上出错，必须比字节长度。
   const [atArg, oldText, newText] = rest
   const at = Number(atArg)
-  if (newText.length !== oldText.length) {
-    console.log(`长度不等（${oldText.length} vs ${newText.length}）—— 拒绝写入`)
+  const oldBytes = Buffer.from(oldText, 'utf8')
+  const newBytes = Buffer.from(newText, 'utf8')
+  if (newBytes.length !== oldBytes.length) {
+    console.log(`字节长度不等（${oldBytes.length} vs ${newBytes.length}）—— 拒绝写入`)
     process.exit(1)
   }
-  const buffer = Buffer.alloc(oldText.length)
-  fs.readSync(fd, buffer, 0, oldText.length, baseOffset + at)
-  const found = buffer.toString('latin1')
-  if (found !== oldText) {
-    console.log(`该位置实际为 ${JSON.stringify(found)}，与预期不符 —— 拒绝写入`)
+  const buffer = Buffer.alloc(oldBytes.length)
+  fs.readSync(fd, buffer, 0, oldBytes.length, baseOffset + at)
+  if (!buffer.equals(oldBytes)) {
+    console.log(`该位置实际为 ${JSON.stringify(buffer.toString('utf8'))}，与预期不符 —— 拒绝写入`)
     process.exit(1)
   }
-  fs.writeSync(fd, Buffer.from(newText, 'latin1'), 0, newText.length, baseOffset + at)
+  fs.writeSync(fd, newBytes, 0, newBytes.length, baseOffset + at)
   console.log(`已在数据区偏移 ${at} 把 ${JSON.stringify(oldText)} 改为 ${JSON.stringify(newText)}`)
 } else if (command === 'backup') {
   const backup = `${archive}.bak-projectless`

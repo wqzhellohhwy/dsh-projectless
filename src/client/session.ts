@@ -54,6 +54,7 @@ export interface SessionListFace {
   ids: readonly SessionId[]
   isBlank(sessionId: SessionId): boolean | undefined
   cwdOf(sessionId: SessionId): string | undefined
+  updatedAt(sessionId: SessionId): number | undefined
 }
 
 export interface ProjectlessSessionDeps {
@@ -61,12 +62,25 @@ export interface ProjectlessSessionDeps {
   sessions: SessionCreateFace
   /** Navigate the main view to a Session. */
   openSession(sessionId: SessionId): void
-  /** Ask the Host half to ensure the shared "Ungrouped" directory and return it. */
-  ensureGroupDirectory(): Promise<string>
-  /** Current Session list, used to reuse the blank projectless Session. */
+  /** Provision the working directory for one *new* Session (one per Session). */
+  provisionDirectory(): Promise<string>
+  /** Current Session list, used to find a blank projectless Session to reuse. */
   listSessions(): SessionListFace
   /** Whether a Session is registered against a Workspace. */
   hasWorkspace(sessionId: SessionId): boolean
+  /**
+   * Whether a Session is a blank projectless one **this page** started.
+   *
+   * Deliberately narrow. "Reuse the blank projectless Session" must not reach
+   * back into history: an old blank Session from a previous run is not the
+   * conversation the user is starting now, and reopening it would silently
+   * give the new conversation somebody else's directory. Only a Session this
+   * page created — i.e. one the user just opened and has not sent to yet —
+   * counts.
+   */
+  isReusable(sessionId: SessionId): boolean
+  /** The Session the main view currently retains, if any. */
+  currentSessionId(): SessionId | undefined
 }
 
 export interface ProjectlessSessionReceipt {
@@ -77,35 +91,39 @@ export interface ProjectlessSessionReceipt {
 }
 
 /**
- * Open the projectless Session — reusing it if it is already there.
+ * Open a projectless Session — reusing an unused one if there is one.
  *
- * The whole point is *when* things get created. A "new Session" is not a new
- * Session: DSH keeps at most one blank Session per destination and an
- * unsent draft lives on the Session, so creating a fresh one on every click
- * both churns working directories and throws the typed text away. So:
+ * Two things have to hold at once, and they pull in opposite directions:
  *
- * - the working directory is **shared and stable** (`ROOT/<label>`, where the
- *   label is DSH's own word for the plain-Session bucket), created once;
- * - if a blank Session already sits on that directory and belongs to no
- *   Workspace, it is **reopened as-is** — same Session, same draft;
- * - otherwise exactly one Session is created on that directory.
+ * 1. **Every conversation gets its own working directory.** Sharing one
+ *    directory across Sessions would mean every projectless conversation reads
+ *    and writes the same files, which is not what "no workspace" should mean.
+ * 2. **Clicking "new Session" must not churn.** Creating a Session (and a
+ *    directory) on every click both litters the filesystem and throws away the
+ *    text typed into the previous blank Session — DSH keeps the unsent draft on
+ *    the Session, and the Session is only "reusable" while it is blank.
  *
- * The Session still belongs to **no Workspace**, so it lands under Ungrouped,
- * and its `cwd` is what lets the Host route a prompt. DSH disables the blank
- * composer for a Session with no Workspace to name; that gate is reopened by
- * `installComposerGate` (see `composer.ts`), and the stable directory name is
- * what the hero's workspace chip displays.
+ * So the clock only starts when it has to: a *blank* projectless Session is
+ * reused, and a directory is provisioned only when there is none to reuse —
+ * which, in practice, means after the previous conversation actually started.
  */
 export async function createProjectlessSession(deps: ProjectlessSessionDeps): Promise<ProjectlessSessionReceipt> {
-  const cwd = await deps.ensureGroupDirectory()
   const list = deps.listSessions()
-  const reusable = list.ids.find(id => list.isBlank(id) === true
-    && list.cwdOf(id) === cwd
-    && !deps.hasWorkspace(id))
-  if (reusable !== undefined) {
-    deps.openSession(reusable)
-    return { sessionId: reusable, cwd, reused: true }
+  const current = deps.currentSessionId()
+  const reusable = list.ids.filter(id => deps.isReusable(id)
+    && list.isBlank(id) === true
+    && !deps.hasWorkspace(id)
+    && list.cwdOf(id) !== undefined)
+  // Prefer the Session already on screen (then "new Session" is a no-op rather
+  // than a jump), otherwise the most recently touched blank one.
+  const pick = current !== undefined && reusable.includes(current)
+    ? current
+    : reusable.slice().sort((a, b) => (list.updatedAt(b) ?? 0) - (list.updatedAt(a) ?? 0))[0]
+  if (pick !== undefined) {
+    deps.openSession(pick)
+    return { sessionId: pick, cwd: list.cwdOf(pick) ?? '', reused: true }
   }
+  const cwd = await deps.provisionDirectory()
   const sessionId = await deps.sessions.create({ cwd })
   deps.openSession(sessionId)
   return { sessionId, cwd, reused: false }

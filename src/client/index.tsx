@@ -31,10 +31,12 @@ import {
   PROJECTLESS_ENTRY_ID,
   createProjectlessSession,
   requestGroupDirectory,
+  requestProjectlessDirectory,
   requestProjectlessRoot,
   workspaceOfSession,
 } from './session.ts'
 import { installComposerGate, type ComposerGateStats } from './composer.ts'
+import { isProjectlessPath } from '../shared/paths.ts'
 import { report, type DiagnosticsReply } from './diagnostics.ts'
 import { runProjectlessSelftest } from './selftest.ts'
 import { PROJECTLESS_LOCALE_NS, projectlessLocales } from './locales.ts'
@@ -48,7 +50,7 @@ import {
 const PACKAGE_ID = 'dsh-projectless'
 const VERSION = '1.0.0'
 /** Bumped on every build so a stale page is distinguishable from a fresh one. */
-const BUILD = 37
+const BUILD = 41
 /**
  * Run the self-test on every page load. Always false in a build that is meant
  * to be used: the self-test opens and closes real Sessions on screen, so it
@@ -455,19 +457,6 @@ export function apply(ctx: Context): void {
     return live
   }
 
-  /**
-   * The name of the shared projectless working directory — DSH's own word for
-   * the plain-Session bucket. DSH prints a directory's basename on the hero's
-   * workspace chip, so this is what that chip ends up reading.
-   */
-  const groupLabel = (): string => {
-    try {
-      const label = ctx.locale.bind(PROJECTLESS_LOCALE_NS)('group.ungrouped')
-      if (typeof label === 'string' && label !== '') return label
-    } catch { /* dictionary not registered yet */ }
-    return 'Ungrouped'
-  }
-
   const hasWorkspace = (sessionId: SessionId): boolean => {
     try {
       return workspaceOfSession(ctx.workspaces.list.getSnapshot().items ?? [], sessionId) !== undefined
@@ -480,16 +469,21 @@ export function apply(ctx: Context): void {
     const receipt = await createProjectlessSession({
       sessions: ctx.sessions as never,
       openSession: sessionId => { ui.openSession(sessionId) },
-      ensureGroupDirectory: () => requestGroupDirectory(rpc, groupLabel()),
+      provisionDirectory: () => requestProjectlessDirectory(rpc),
       listSessions: () => {
         const snapshot = ctx.sessions.list.getSnapshot()
         return {
           ids: snapshot.ids ?? [],
           isBlank: (id: SessionId) => snapshot.byId[id]?.blank,
           cwdOf: (id: SessionId) => snapshot.byId[id]?.cwd,
+          updatedAt: (id: SessionId) => snapshot.byId[id]?.updatedAt,
         }
       },
       hasWorkspace,
+      // Only Sessions this page started count as reusable — see the doc comment
+      // on `ProjectlessSessionDeps.isReusable`.
+      isReusable: (sessionId) => orphanSessions.has(sessionId),
+      currentSessionId: () => currentSessionId(ctx),
     })
     orphanSessions.add(receipt.sessionId)
     report(ctx, {
@@ -497,7 +491,6 @@ export function apply(ctx: Context): void {
       sessionId: receipt.sessionId,
       cwd: receipt.cwd,
       reused: receipt.reused,
-      label: groupLabel(),
       orphans: orphanSessions.size,
     })
     return receipt.sessionId
