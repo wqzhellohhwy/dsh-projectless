@@ -36,6 +36,7 @@ import {
   workspaceOfSession,
 } from './session.ts'
 import { installComposerGate, type ComposerGateStats } from './composer.ts'
+import { attachmentStats, keepDraftAttachments, type AttachmentRetentionStats } from './attachments.ts'
 import { isProjectlessPath } from '../shared/paths.ts'
 import { report, type DiagnosticsReply } from './diagnostics.ts'
 import { runProjectlessSelftest } from './selftest.ts'
@@ -50,7 +51,7 @@ import {
 const PACKAGE_ID = 'dsh-projectless'
 const VERSION = '1.0.0'
 /** Bumped on every build so a stale page is distinguishable from a fresh one. */
-const BUILD = 46
+const BUILD = 47
 /**
  * Run the self-test on every page load. Always false in a build that is meant
  * to be used: the self-test opens and closes real Sessions on screen, so it
@@ -317,7 +318,9 @@ async function selfCheck(
   ctx: Context,
   phase: string,
   gate: ComposerGateStats,
+  attachments: AttachmentRetentionStats,
 ): Promise<DiagnosticsReply | undefined> {
+  attachmentStats(ctx, attachments)
   let orderBy: string | null = null
   let storedAccounts: Record<string, { members: number, outOfRecency: number }> | null = null
   try {
@@ -389,7 +392,11 @@ async function selfCheck(
         return `err:${String(reason).slice(0, 60)}`
       }
     })(),
-    composerGate: { borrowed: gate.borrowed, opened: gate.opened, rendered: gate.rendered, syncs: gate.syncs, entriesSeen: gate.entriesSeen, registered: gate.registered, lastError: gate.lastError, probe: gate.probe },
+    composerGate: { borrowed: gate.borrowed, opened: gate.opened, rendered: gate.rendered, syncs: gate.syncs, entriesSeen: gate.entriesSeen, registered: gate.registered, givenUp: gate.givenUp, lastError: gate.lastError, probe: gate.probe },
+    // `live` is DSH's own draft-attachment Map size — the number that decides
+    // whether a thumbnail can still render. It must stay flat across Session
+    // switches now; before this change it dropped to 0 on every switch.
+    attachments,
     orderBy,
     storedAccounts,
     sidebarSections,
@@ -440,6 +447,14 @@ export function apply(ctx: Context): void {
 
   /** Projectless Sessions this page started; pruned as they stop qualifying. */
   const orphanSessions = new Set<SessionId>()
+
+  /**
+   * Pasted-image drafts, kept alive across Session switches. DSH releases a
+   * Session's attachments when its input shell tears down, which permanently
+   * deletes the bytes and revokes the thumbnail URL — text drafts survive
+   * because they are mirrored into localStorage, images have no such mirror.
+   */
+  const attachments: AttachmentRetentionStats = keepDraftAttachments(ctx, PACKAGE_ID)
 
   /**
    * The tracked Sessions that are still blank and still belong to no Workspace.
@@ -510,8 +525,8 @@ export function apply(ctx: Context): void {
   // A steady self-report runs in every mode, so a bisection step is observable
   // from outside the page without anyone having to look at the screen.
   report(ctx, { phase: 'probe-attached', build: BUILD, ui: ENABLE_UI, order: ENABLE_ORDER, session: ENABLE_SESSION })
-  window.setTimeout(() => { void selfCheck(ctx, 'probe', gate) }, 3000)
-  const ticker = window.setInterval(() => { void selfCheck(ctx, 'tick', gate) }, 8000)
+  window.setTimeout(() => { void selfCheck(ctx, 'probe', gate, attachments) }, 3000)
+  const ticker = window.setInterval(() => { void selfCheck(ctx, 'tick', gate, attachments) }, 8000)
   ctx.effect(() => () => { window.clearInterval(ticker) }, `${PACKAGE_ID}: probe ticker`)
   if (PROBE_ONLY) return
   if (!ENABLE_UI && !ENABLE_ORDER && !ENABLE_SESSION) return
@@ -583,8 +598,44 @@ export function apply(ctx: Context): void {
   // is the only one, and it costs a real Session round trip, so it never runs
   // unless somebody asked for it from outside the page.
   window.setTimeout(() => {
-    void selfCheck(ctx, 'applied', gate).then((reply) => {
-      if (!FORCE_SELFTEST && !(reply?.commands ?? []).includes('projectless-selftest')) return
+    void selfCheck(ctx, 'applied', gate, attachments).then((reply) => {
+      const commands = reply?.commands ?? []
+      if (commands.includes('attachment-probe')) {
+        // Self-verification for the retained-attachment wrapper. A real paste
+        // cannot be synthesized from here, but the *destructive step* can: put a
+        // stand-in image into DSH's own draft table, run the exact call DSH uses
+        // when it tears a composer down, and report whether the entry survived.
+        // Before the wrapper this always came back `survived: false`.
+        const face = (() => {
+          try {
+            return ctx.get('conversation' as never) as unknown as {
+              draftAttachments?: Map<string, unknown>
+              releaseDraftAttachment?: (id: string) => void
+            } | undefined
+          } catch {
+            return undefined
+          }
+        })()
+        const probeId = 'projectless-attachment-probe'
+        const before = face?.draftAttachments?.size ?? -1
+        const stand_in = { id: probeId, kind: 'image', previewUrl: 'data:image/gif;base64,R0lGODlhAQABAAAAACw=' }
+        try { face?.draftAttachments?.set(probeId, stand_in) } catch { /* probe is best effort */ }
+        const added = face?.draftAttachments?.has(probeId) ?? false
+        try { face?.releaseDraftAttachment?.(probeId) } catch { /* probe is best effort */ }
+        const survived = face?.draftAttachments?.has(probeId) ?? false
+        // Leave no stand-in behind in either outcome.
+        try { face?.draftAttachments?.delete(probeId) } catch { /* probe is best effort */ }
+        report(ctx, {
+          phase: 'attachment-probe',
+          wrapperRetained: attachments.retained,
+          deferred: attachments.deferred,
+          before,
+          added,
+          survived,
+          verdict: survived ? '保留成功：释放被拦截' : '未保留：释放仍然生效',
+        })
+      }
+      if (!FORCE_SELFTEST && !commands.includes('projectless-selftest')) return
       void runProjectlessSelftest(ctx, {
         startProjectlessSession,
         openSession: sessionId => { ui.openSession(sessionId) },
