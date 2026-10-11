@@ -10,35 +10,76 @@
 
 ## 一、这个插件做什么
 
-DSH 原生只能在工作区里新建会话。本插件补上四件事：
+DSH 原生只能在工作区里新建会话：没有归属的会话在界面上是残缺的（编辑器被禁用），
+而「新建」这个动作又总是落到某个工作区上。本插件补上这些：
 
 ### 1. 无工作区会话（选择器里的入口）
 
 工作区选择器里多一项 **「无工作区会话」**。点它会：
 
-1. 在 `~/Documents/DSH/YYYY-MM-DD/session-HH-mm-ss-随机串/` 建一个独立目录；
-2. 把它登记成一个**临时工作区**；
-3. 在临时工作区里创建并打开会话 —— 因此编辑器是**完整的原生界面**
-   （Agent 预设、命令与附件、访问模式、模型选择、发送按钮全都在）；
-4. DSH 接受第一条消息后，只注销那条**临时工作区注册**，会话与目录都留下，
-   会话落到**未分组**区域，重启后可继续。
+1. 在 `~/Documents/DSH/YYYY-MM-DD/session-HH-mm-ss-随机串/` 建一个**该对话专属**的目录；
+2. 用 `sessions.create({ cwd })` 建会话 —— **不登记任何工作区**，因此它天然属于**未分组**，
+   侧边栏不会多出分组，也不存在「建了再拆」或事后回收；
+3. 会话界面上是完整的原生编辑器（Agent 预设、命令与附件、访问模式、模型选择、发送按钮都在）。
 
-### 2. 新会话默认就是无工作区会话
+> **每个对话一个独立目录**，不是一个共用目录 —— 无工作区会话之间互不干扰彼此的文件。
 
-侧边栏的「新会话」按钮原本会落到当前工作区（或最近使用的工作区）。装了本插件后，
-**不带工作区的新会话**会直接开成无工作区会话；分组标题栏上的「+」仍然在该分组里建会话，
+### 2. 「新会话」默认就是无工作区会话
+
+侧边栏的「新会话」按钮原本落到当前工作区（或最近使用的工作区）。装了本插件后，
+**不带工作区的新会话**直接开成无工作区会话；分组标题栏上的「+」仍在**该分组内**建会话，
 原生行为一点没变。
 
-### 3. 侧边栏顺序
+### 3. 复用而不是重建（所以连点不会刷目录、也不会吃掉草稿）
+
+点「新会话」时，如果**本页面刚开的那个空白会话**还在（没发过消息、不属于任何工作区），
+就**直接复用它**：不建目录、不建会话，草稿留在原处。
+
+- 连续点「新会话」→ 始终是同一个会话，**目录数量不变**；
+- 输入了文字或贴了图但没发送，切走再点回来 → **内容还在**；
+- 一旦**发过消息**，下次「新会话」才开**新的目录 + 新的会话**。
+
+复用只认「本页面启动的空白会话」，不会去翻历史遗留的空会话，避免被塞进几小时前的旧目录。
+
+### 4. 侧边栏顺序
 
 - **未分组永远在工作区分组之上**；
-- 空白无工作区会话的临时分组，排在未分组**更上面**（新会话不会掉到列表底部）；
-- 手动排序模式下，**每个分组都保持「最新在上」**。
+- **手动排序模式下，每个分组都保持「最新在上」**，并且是**实时**的 —— 每 3 秒一次节流写入，
+  写后回读校验；只有「怎么写都写不进去」的账户才会停手，不会自激刷屏；
+- 「最近更新」排序模式下**静默**，尊重 DSH 自己的顺序。
 
-### 4. 未发送的草稿会被保留 ← 本轮新增
+### 5. 未发送的草稿会保留（文字）
 
-在没有工作区的空白会话里打了字但没发送，然后点了别的会话：**文字还在**。
-点回那个会话，输入框里的内容原样恢复，跟普通工作区新建会话一样。
+在无工作区的空白会话里打了字但没发送，然后点了别的会话：**文字还在**。点回来，输入框里的
+内容原样恢复，跟普通工作区新建会话一样。
+
+### 6. 粘贴的图片跨会话保留
+
+贴进输入框的图片，切到别的会话再切回来**仍然在**。这条**对所有会话生效**（未分组与各个
+工作区一视同仁），实现上分两层：
+
+- **字节层**：拦截 DSH 的 `releaseDraftAttachment`，把「销毁式释放」改成「延迟释放」——
+  条目留在 DSH 自己的表里，缩略图 URL 不被 revoke；只保留最近 64 个，更旧的照常释放，
+  内存有上限。
+- **渲染层**：记住会话输入壳的附件 id 列表，切回时若它空了就补回去。（只保住字节不够 ——
+  渲染读的是那份 id 列表，列表空了就什么都不画，不论字节在不在。）
+
+> 仍然不做：**跨页面刷新**。blob URL 无法跨刷新存活，要保住必须把字节存进 IndexedDB 并在
+> 恢复时重新上传，属于另一量级的改动。
+
+### 7. 未分组标签显示「未分组」
+
+无工作区会话在 hero 上的工作区标签固定显示 **「未分组」**，而不是它那份 `session-…` 目录名。
+这一条需要[第二处 DSH 侧补丁](#八为什么需要给-dsh-本体打补丁)。
+
+### 8. 诊断与自检
+
+- 页面每次装载与运行期**定期上报**一张 JSONL 快照（侧边栏分组数、排序偏离度、补丁状态、
+  会话与目录情况）；
+- **补丁状态自检**：Host 每次启动读一次应用归档，明确告诉你两处补丁在不在 ——
+  因为「输入框还是灰的」和「补丁没打」在界面上长得一模一样；
+- **可远程触发的命令通道**：往 `%TEMP%\dsh-projectless-commands.json` 写命令即可让下一次
+  页面加载执行一次自检（新会话往返、草稿往返、图片往返），结果写回诊断文件。
 
 ---
 
@@ -328,12 +369,17 @@ node tools/dsh-composer-gate/install-patches.mjs --restore  # 还原
 ## 九、已知取舍
 
 1. **手动拖拽的顺序会被覆盖**。本插件的立场是各分组永远「最新在上」，
-   下一次顺序刷新会写回时间序。
-2. **空白无工作区会话立刻能打字，依赖上面那处 DSH 侧补丁**；没打补丁时
-   「新会话」走 DSH 原生路径。
+   下一次顺序刷新会写回时间序（有 3 秒节流，并且写后校验，不会自激）。
+2. **空白无工作区会话立刻能打字，依赖上面那两处 DSH 侧补丁**；没打补丁时
+   「新会话」走 DSH 原生路径，标签显示目录名。
 3. **无工作区会话没有「载体工作区」**：插件不创建临时工作区，也没有回收逻辑 ——
-   会话一直留在未分组里，草稿跟着会话走。
-4. 「单一列表」视图不参与顺序维护。
+   会话一直留在未分组里，草稿与图片都跟着会话走。
+4. **粘贴的图片只在「切会话」范围内保留**，跨页面刷新仍会丢（blob URL 无法跨刷新存活，
+   要保住必须把字节存进 IndexedDB 并在恢复时重新上传）。保留上限 64 个，更旧的照常释放。
+5. 「单一列表」视图不参与顺序维护。
+6. `conversation.composer.bar` 的插槽覆盖是**已知死路**（继承 `children` 会与内建 entry
+   的子插槽声明冲突，不继承则缺 `renderSlot` 而每次渲染抛错），因此该功能默认关闭，
+   代码留档说明；输入框的可用性由 DSH 侧补丁保证。
 
 ---
 
@@ -344,15 +390,24 @@ workspace** end to end. It merges the former `dsh-projectless-session` provider
 with the sidebar behaviour of `dsh-ungrouped-top` into one package:
 
 - a **Session without workspace** entry in the Workspace picker, backed by a
-  date-organised scratch directory (`~/Documents/DSH/YYYY-MM-DD/session-…`);
-- the native blank-session composer while a projectless Session is open, and a
-  clean hand-off to **Ungrouped** once the first prompt is accepted;
-- an unqualified **new Session opens projectless**;
-- **Ungrouped stays above every workspace group**, the temporary group above
-  Ungrouped, and every group keeps newest-first order under manual sorting;
-- an unsent draft survives clicking away: the blank Session is no longer
-  reclaimed on navigation, only when a newer projectless Session is started or
-  the next DSH run sweeps what a previous run left behind.
+  per-conversation directory (`~/Documents/DSH/YYYY-MM-DD/session-…`) — sessions
+  never share a working directory;
+- the Session belongs to **no Workspace at all**, so it lands under **Ungrouped**
+  with no grouping to create or reclaim;
+- an unqualified **new Session opens projectless**, and **reuses** the page's own
+  blank projectless Session instead of creating another one — clicking twice does
+  not churn directories and does not discard a draft;
+- **Ungrouped stays above every workspace group**, and every group keeps
+  newest-first order under manual sorting, refreshed live;
+- an unsent **text draft** survives navigating away, and so do **pasted images**:
+  the attachments are kept alive past DSH's destructive release, and the shell's
+  attachment-id list is restored when it comes back empty;
+- a diagnostics channel plus patch self-check, since "the composer is still inert"
+  and "the patch was never applied" look identical in the UI.
+
+Note: usable paste-in-a-blank-projectless-Session still requires two small patches
+to DSH's own `app.asar` (shipped under `tools/dsh-composer-gate/`, applied with one
+command, reversible), and image retention does not survive a page reload.
 
 Install: `dsh plugin --profile <profile> add github:<you>/dsh-projectless`, then
 restart DSH. Configuration, diagnostics and the scripted draft self-test are

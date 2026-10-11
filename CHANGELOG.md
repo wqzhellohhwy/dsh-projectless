@@ -1,5 +1,103 @@
 # Changelog
 
+## 1.7.0
+
+### 修复：图片跨会话丢失的第二层 —— shell 的附件 id 列表需要恢复
+
+1.6.1 保住了字节，但实测仍然看不到图。写了**端到端探测**（合成真实粘贴 → 切走 → 切回，
+每步采样）后，失败点自己报了出来：
+
+```
+after-paste        thumbs=1  live=1  shellIds=1  shellDraft=3
+after-switch-away  thumbs=0  live=1  shellIds=0
+after-switch-back  thumbs=0  live=1  shellIds=0  shellDraft=3   ← 字节在，画不出来
+```
+
+字节始终没丢（`live=1`），丢的是 `shell.snapshot.attachmentIds` —— 渲染走的是
+`resolveDraftAttachments(input.attachmentIds)`，列表空了就什么都不画。文字草稿能回来，
+是因为 DSH 把它镜像进 localStorage；附件的 id 列表没有对应机制。
+
+修法：包装 `conversation.input.shell(id)` —— 挂 `shell.dispose` 记住 id 列表，之后拿到的
+shell 若列表为空而表里有记录，用 `shell.addAttachments(ids)` 补回。幂等，且只在
+「空列表 + 有记录」时动手，不覆盖正常状态。
+
+实测（build 52）：`after-switch-back` 恢复为 `thumbs=1 chips=1 live=1 shellIds=1`，
+计数 `restored=1`。
+
+### 新增：可远程触发的端到端探测（`attachment-probe.ts`）
+
+用 `ClipboardEvent` + `DataTransfer` 合成**真实粘贴**，走的是 DSH 的生产粘贴路径；
+同时采样 DOM 缩略图数（用户看到的东西）与字节数（是否存在），两者分开报，
+才能区分「数据丢了」和「画不出来」。命令：往 `%TEMP%\dsh-projectless-commands.json`
+写 `{"commands":["attachment-roundtrip"]}`。
+
+## 1.6.1
+
+### 修复：附件保留从未生效 —— 服务晚注册，同步 get 必然拿不到
+
+1.6.0 的包装装不上，功能**静默失效**。探针把真因钉死了：
+
+```
+attachments: {installed:false,
+              lastError:'conversation service has no releaseDraftAttachment',
+              probe:'typeof undefined'}
+```
+
+`probe` 是 `typeof undefined` —— `ctx.get('conversation')` 返回的就是 `undefined`，不是
+「对象存在但没方法」；两种情况被我写进同一句话，掩盖了真相。原因是 `conversation` 服务由
+DSH 自己的 conversation 插件（`ctx.plugin(ConversationController, …)`）注册，而它在本插件
+**之后** apply，我在 apply 时同步 `get` 一次就再没试过。
+
+改为 `ctx.inject(['conversation'], install)`。回归测试补上第 5 组用例专门覆盖晚注册场景，
+mock 也补了 `inject`（否则测试会在错误假设下全绿）。
+
+## 1.6.0
+
+### 新增：粘贴的图片跨会话保留（所有会话，不限于未分组）
+
+文字草稿会被 DSH 镜像进 localStorage，图片没有这个镜像：它只活在内存里，而
+`releaseDraftAttachment(id)` 会同时做两件不可逆的事 —— 删表项、revoke 缩略图 URL。
+
+新增 `attachments.ts`：包装该函数，把「销毁式释放」改成「延迟释放」，最近 64 个保留、
+更旧的照常释放（内存有上限）。
+
+## 1.5.0
+
+### 修复：composer 插槽覆盖是死路，停用它并解除 ready 对它的依赖
+
+修对 `children` 取值（1.4.2）后暴露出真正的终局，这条路两头都不通：
+
+- **继承**内建 entry 的 `children` → 注册被拒：`slot "conversation.input.attachments" is
+  already declared`（`children` 是「声明 + 授权 + 运行时 spec」三合一，重复声明即冲突）；
+- **不继承** → 缺 `renderSlot` prop → 内建 InputBar 每次渲染抛 TypeError。
+
+于是取消重试（注册错误含 `already declared` 即置 `givenUp` 并清掉 5 秒 interval ——
+它此前每 5 秒必然失败一次，是长期异常与内存只增不减的来源之一）、`ready` 不再依赖
+`gate.registered`（它恒 false 会让「新会话」整条流程退化）、`ENABLE_COMPOSER_GATE`
+默认 false。**输入框可用一直靠 DSH 侧补丁，与 gate 无关。**
+
+## 1.4.2
+
+### 修复：从错位置读 children，导致 composer 插槽 entry 每次渲染都崩
+
+`composer.ts` 从 `found.options?.children` 继承子插槽声明，但 DSH 的 `StoredEntry` 里
+`children` 在**顶层**，`options` 下只有 `key/id/order/label/priority`。于是这里恒为
+`undefined` —— 同一段代码紧挨着的 `found.locale` 却是对的，两种取法并存就是铁证。
+
+后果链：覆盖 entry 没有 `children` → 渲染机制不派发 `renderSlot` → 原样转发的 InputBar
+调 `renderSlot(...)` → TypeError → 每次渲染都崩。这也解释了长期异常的
+`composerGate.opened` 恒为 0：gate 从未成功放行过。
+
+## 1.4.1
+
+### 修复：排序维护改回实时
+
+1.4.0 为修「排序写入自激把侧边栏写空」加了「每个账户每页面只写一次」的限制，副作用是顺序
+只在页面加载时校准一次，之后不再维护（实测 `b4054af3=2/2`、`db64ae36=6/87`，只有重启才恢复）。
+
+改为**冷却 3 秒 + 写入有效性检测**（写后 400ms 回读；DSH 自己覆盖存储属正常，下次照写，
+只有「永远不生效」才退役该账户）。实测所有分组 `outOfRecency` 归零。
+
 ## 1.4.0
 
 ### 新增：补丁工程化（面向任意用户，不再依赖本机路径）
