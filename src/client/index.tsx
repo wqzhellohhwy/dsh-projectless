@@ -36,7 +36,8 @@ import {
   workspaceOfSession,
 } from './session.ts'
 import { installComposerGate, type ComposerGateStats } from './composer.ts'
-import { attachmentStats, keepDraftAttachments, type AttachmentRetentionStats } from './attachments.ts'
+import { attachmentStats, keepDraftAttachments, liveAttachmentCount, type AttachmentRetentionStats } from './attachments.ts'
+import { runAttachmentRoundTrip } from './attachment-probe.ts'
 import { isProjectlessPath } from '../shared/paths.ts'
 import { report, type DiagnosticsReply } from './diagnostics.ts'
 import { runProjectlessSelftest } from './selftest.ts'
@@ -51,7 +52,7 @@ import {
 const PACKAGE_ID = 'dsh-projectless'
 const VERSION = '1.0.0'
 /** Bumped on every build so a stale page is distinguishable from a fresh one. */
-const BUILD = 49
+const BUILD = 52
 /**
  * Run the self-test on every page load. Always false in a build that is meant
  * to be used: the self-test opens and closes real Sessions on screen, so it
@@ -633,6 +634,41 @@ export function apply(ctx: Context): void {
           added,
           survived,
           verdict: survived ? '保留成功：释放被拦截' : '未保留：释放仍然生效',
+        })
+      }
+      if (commands.includes('attachment-roundtrip')) {
+        // Walk the real paste → switch away → switch back path and sample after
+        // each step, so whichever step loses the image names itself.
+        void runAttachmentRoundTrip(ctx, {
+          currentSessionId: () => currentSessionId(ctx),
+          otherSessionId: (exclude) => {
+            try {
+              const snapshot = ctx.sessions.list.getSnapshot()
+              return (snapshot.ids ?? []).find((id: string) => id !== exclude
+                && snapshot.byId[id]?.blank !== true
+                && (snapshot.byId[id]?.retainedBy?.mainView ?? 0) === 0)
+            } catch {
+              return undefined
+            }
+          },
+          openSession: sessionId => { ui.openSession(sessionId as never) },
+          liveAttachments: () => liveAttachmentCount(ctx),
+          shellState: (sessionId) => {
+            if (sessionId === undefined) return undefined
+            try {
+              const input = (ctx.get('conversation' as never) as unknown as {
+                input?: { shell?: (id: string) => { snapshot?: { attachmentIds?: readonly string[], draft?: string } } }
+              } | undefined)?.input
+              const shell = input?.shell?.(sessionId)
+              return {
+                ids: shell?.snapshot?.attachmentIds?.length ?? -1,
+                draft: (shell?.snapshot?.draft ?? '').length,
+                sameShell: shell !== undefined,
+              }
+            } catch {
+              return undefined
+            }
+          },
         })
       }
       if (!FORCE_SELFTEST && !commands.includes('projectless-selftest')) return

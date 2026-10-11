@@ -38,9 +38,19 @@ interface AttachmentLike {
   [key: string]: unknown
 }
 
+/** The slice of DSH's per-Session input shell this module touches. */
+interface ShellLike {
+  snapshot?: { attachmentIds?: readonly string[], draft?: string } | undefined
+  addAttachments?: (ids: readonly string[]) => unknown
+  dispose?: () => unknown
+  /** Marks a shell already wrapped, so a repeat `shell(id)` is a no-op. */
+  __projectlessShellHook?: boolean
+}
+
 interface ConversationFace {
   draftAttachments?: Map<string, AttachmentLike>
   releaseDraftAttachment?: (id: string) => void
+  input?: { shell?: (id: string) => ShellLike | undefined }
 }
 
 export interface AttachmentRetentionStats {
@@ -52,6 +62,8 @@ export interface AttachmentRetentionStats {
   live: number
   /** Releases that were deferred instead of destroying the attachment. */
   deferred: number
+  /** Times a rebuilt shell had its remembered attachment ids put back. */
+  restored: number
   lastError: string | null
   /** Shape of the service, captured when the wrapper could not install. */
   probe?: string
@@ -92,7 +104,7 @@ function describeService(value: unknown): string {
  * the client face can be re-applied by a bundle reload.
  */
 export function keepDraftAttachments(ctx: Context, pluginName: string): AttachmentRetentionStats {
-  const stats: AttachmentRetentionStats = { installed: false, retained: 0, live: 0, deferred: 0, lastError: null }
+  const stats: AttachmentRetentionStats = { installed: false, retained: 0, live: 0, deferred: 0, restored: 0, lastError: null }
 
   const install = (scope: Context): void => {
     if (stats.installed) return
@@ -152,6 +164,51 @@ export function keepDraftAttachments(ctx: Context, pluginName: string): Attachme
       evict()
     }
 
+    // Keeping the bytes alive is not enough: the composer draws
+    // `resolveDraftAttachments(shell.snapshot.attachmentIds)`, and a rebuilt
+    // shell starts with an empty id list. The probe showed exactly that split —
+    // `live=1` (bytes fine) beside `shellIds=0` (nothing to draw) after a switch
+    // away and back, while the *text* draft came back because DSH mirrors that
+    // one into localStorage. So the id list needs the same treatment: remember
+    // it when the shell goes away, put it back when a shell for that Session is
+    // handed out empty.
+    const inputFace = (conversation as ConversationFace & {
+      input?: {
+        shell?: (id: string) => ShellLike | undefined
+      }
+    }).input
+    if (inputFace !== undefined && typeof inputFace.shell === 'function') {
+      const shellFor = inputFace.shell.bind(inputFace)
+      const remembered = new Map<string, string[]>()
+      inputFace.shell = (id: string): ShellLike | undefined => {
+        let shell: ShellLike | undefined
+        try {
+          shell = shellFor(id)
+        } catch {
+          return undefined
+        }
+        if (shell === undefined || shell === null) return shell
+        if (shell.__projectlessShellHook === true) return shell
+        shell.__projectlessShellHook = true
+        const originalDispose = typeof shell.dispose === 'function' ? shell.dispose.bind(shell) : undefined
+        if (originalDispose !== undefined) {
+          shell.dispose = (): unknown => {
+            const ids = shell?.snapshot?.attachmentIds
+            if (Array.isArray(ids) && ids.length > 0) remembered.set(id, [...ids])
+            return originalDispose()
+          }
+        }
+        const stale = remembered.get(id)
+        if (stale !== undefined && stale.length > 0 && (shell.snapshot?.attachmentIds?.length ?? 0) === 0) {
+          try {
+            shell.addAttachments?.(stale)
+            stats.restored += 1
+          } catch { /* the shell may refuse ids it no longer knows */ }
+        }
+        return shell
+      }
+    }
+
     scope.effect(() => () => {
       retained.clear()
       delete holder.__projectlessRetains
@@ -168,6 +225,16 @@ export function keepDraftAttachments(ctx: Context, pluginName: string): Attachme
     stats.lastError = `inject(conversation): ${String(reason).slice(0, 100)}`
   }
   return stats
+}
+
+/** Read DSH's draft-attachment Map size right now (not the cached counter). */
+export function liveAttachmentCount(ctx: Context): number {
+  try {
+    const conversation = ctx.get('conversation' as never) as unknown as ConversationFace | undefined
+    return conversation?.draftAttachments?.size ?? -1
+  } catch {
+    return -1
+  }
 }
 
 /** Snapshot the counters for the diagnostics line. */
