@@ -37,6 +37,17 @@ const SIDEBAR_SLOT = 'sidebar.workspaces' as never
 const TREE = '[role="tree"]:has([data-row-key="workspace:"])'
 
 /**
+ * Minimum spacing between order writes. A write re-enters through the store
+ * subscription that scheduled it, so without a floor the writer and DSH's own
+ * `syncSessionOrders` can trade writes indefinitely; at a few seconds apart the
+ * sidebar still reads as "live" while the page stays responsive.
+ */
+const WRITE_COOLDOWN_MS = 3000
+
+/** Grace period before checking whether a write survived. */
+const WRITE_VERIFY_MS = 400
+
+/**
  * The `display:flex` half is what makes `order` apply to the sidebar's block
  * rows. It was switched off while a blank sidebar was being diagnosed, and the
  * cause turned out to be the order *writer*, not this stylesheet — the empty
@@ -162,8 +173,44 @@ export function keepRecencyOrder(ctx: Context, pluginName: string, write = true)
     let disposers: (() => void)[] = []
     let timers: number[] = []
     let warned = false
-    /** Accounts whose order has already been refreshed once on this page. */
-    const writtenAccounts = new Set<string>()
+    /** Accounts whose write was proven not to stick; those are left alone. */
+    const unwritable = new Set<string>()
+    let lastWriteAt = 0
+    let scheduled: number | undefined
+
+    const schedule = (delay: number): void => {
+      if (disposed || scheduled !== undefined) return
+      scheduled = window.setTimeout(() => {
+        scheduled = undefined
+        sync()
+      }, delay)
+    }
+
+    /**
+     * Confirm a write actually landed.
+     *
+     * DSH re-derives every account's order from what is on screen whenever a
+     * blank Session is selected, so a written order can legitimately be replaced
+     * a moment later — that is normal and the next pass rewrites it. What must
+     * not happen is a write that *never* sticks: that would mean our writer and
+     * DSH's disagree forever, and the retry loop would spin the page. Such an
+     * account is retired for the rest of the page's life.
+     */
+    const verify = (written: Record<string, string[]>): void => {
+      if (disposed || view === undefined) return
+      let after: Record<string, readonly string[]> | undefined
+      try {
+        after = view.getSnapshot().sessionOrderByAccount
+      } catch {
+        return
+      }
+      if (after === undefined) return
+      for (const [account, order] of Object.entries(written)) {
+        if (sameOrder(after[account], order)) unwritable.delete(account)
+        else unwritable.add(account)
+      }
+    }
+
     const sync = (): void => {
       if (disposed || view === undefined) return
       let snapshot: ViewSnapshot
@@ -193,13 +240,8 @@ export function keepRecencyOrder(ctx: Context, pluginName: string, write = true)
         if (!Array.isArray(current) || sameOrder(current, order)) continue
         // Never let a snapshot gap empty out a group that has members recorded.
         if (order.length === 0 && current.length > 0) continue
-        // One write per account per page: a write that does not converge would
-        // otherwise re-enter through the subscription that triggered it.
-        if (writtenAccounts.has(account)) continue
+        if (unwritable.has(account)) continue
         changed[account] = order
-      }
-      if (Object.keys(changed).length > 0) {
-        for (const account of Object.keys(changed)) writtenAccounts.add(account)
       }
       if (Object.keys(changed).length === 0) return
       if (!write) {
@@ -207,11 +249,19 @@ export function keepRecencyOrder(ctx: Context, pluginName: string, write = true)
         console.warn(`${pluginName}: order refresh suppressed (diagnostic), accounts=${Object.keys(changed).length}`)
         return
       }
+      // Writes trigger the subscription that called us, so keep them paced.
+      const since = Date.now() - lastWriteAt
+      if (since < WRITE_COOLDOWN_MS) {
+        schedule(WRITE_COOLDOWN_MS - since)
+        return
+      }
+      lastWriteAt = Date.now()
       try {
         view.store.update((draft) => {
           if (draft.sessionOrderByAccount === undefined) draft.sessionOrderByAccount = {}
           for (const [account, order] of Object.entries(changed)) draft.sessionOrderByAccount[account] = [...order]
         })
+        window.setTimeout(() => { verify(changed) }, WRITE_VERIFY_MS)
       } catch (reason) {
         console.warn(`${pluginName}: cannot refresh a stored order:`, reason)
       }
@@ -251,6 +301,10 @@ export function keepRecencyOrder(ctx: Context, pluginName: string, write = true)
       disposed = true
       for (const timer of timers) window.clearTimeout(timer)
       timers = []
+      if (scheduled !== undefined) {
+        window.clearTimeout(scheduled)
+        scheduled = undefined
+      }
       try { stopSlots() } catch { /* already gone */ }
       for (const dispose of disposers) {
         try { dispose() } catch { /* already gone */ }
