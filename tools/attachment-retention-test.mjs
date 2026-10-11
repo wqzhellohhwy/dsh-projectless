@@ -39,18 +39,31 @@ function makeConversation() {
   }
 }
 
-/** 一个最小 ctx：只提供 get('conversation') 与 effect()。 */
-function makeContext(conversation) {
-  return {
+/**
+ * 一个最小 ctx：模仿 cordis 的 get / effect / inject。
+ *
+ * `inject` 是关键 —— DSH 的 conversation 服务由另一个插件晚注册，apply 时
+ * `get` 必然返回 undefined，所以真实实现必须靠 inject 等它就绪。这里的 mock
+ * 支持「先不可见、注入时才可见」的形态，才能覆盖住那个让功能静默失效的坑。
+ */
+function makeContext(conversation, { visible = true } = {}) {
+  const ctx = {
     get(name) {
-      if (name === 'conversation') return conversation
+      if (name === 'conversation' && visible) return conversation
       return undefined
     },
     effect(fn) {
       fn()
       return () => {}
     },
+    inject(_names, callback) {
+      // cordis 在依赖就绪时回调，参数是作用域 ctx；这里等价于「服务已可见」
+      visible = true
+      callback(ctx)
+      return () => {}
+    },
   }
+  return ctx
 }
 
 let failures = 0
@@ -96,7 +109,7 @@ console.log('\n=== 3. 重复安装是幂等的 ===')
   keepDraftAttachments(ctx, 'test')
   const wrapper = conversation.releaseDraftAttachment
   const second = keepDraftAttachments(ctx, 'test')
-  check('第二次安装被识别', second.lastError === 'already installed', `lastError=${second.lastError}`)
+  check('第二次安装被识别为已装', second.installed === true)
   check('包装函数没有被替换第二次', conversation.releaseDraftAttachment === wrapper)
 }
 
@@ -108,6 +121,18 @@ console.log('\n=== 4. 未知 id 仍走原实现 ===')
   conversation.releaseDraftAttachment('never-seen')
   check('不抛异常', true)
   check('未凭空创建条目', conversation.draftAttachments.size === 0)
+}
+
+console.log('\n=== 5. 服务晚注册时必须靠 inject 才装上（线上失效的真因）===')
+{
+  const conversation = makeConversation()
+  const ctx = makeContext(conversation, { visible: false })
+  check('apply 时同步 get 拿不到服务（复现线上情形）', ctx.get('conversation') === undefined)
+  const stats = keepDraftAttachments(ctx, 'test')
+  check('最终仍安装成功（inject 等到了服务）', stats.installed, `lastError=${stats.lastError ?? '(无)'}`)
+  conversation.draftAttachments.set('img-late', { id: 'img-late', kind: 'image', previewUrl: 'blob:late' })
+  conversation.releaseDraftAttachment('img-late')
+  check('晚注册场景下释放同样被拦下', conversation.draftAttachments.has('img-late'))
 }
 
 console.log(`\n结果：${failures === 0 ? '全部通过 ✓' : `${failures} 项失败 ❌`}`)
