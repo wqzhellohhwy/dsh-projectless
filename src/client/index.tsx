@@ -50,7 +50,7 @@ import {
 const PACKAGE_ID = 'dsh-projectless'
 const VERSION = '1.0.0'
 /** Bumped on every build so a stale page is distinguishable from a fresh one. */
-const BUILD = 45
+const BUILD = 46
 /**
  * Run the self-test on every page load. Always false in a build that is meant
  * to be used: the self-test opens and closes real Sessions on screen, so it
@@ -76,6 +76,17 @@ const ENABLE_ORDER = true
 const ENABLE_SESSION = true
 /** Bisection: locate the sidebar view store but never write to it. */
 const ENABLE_ORDER_WRITE = true
+/**
+ * Dead end, kept for the record and switched off.
+ *
+ * Overriding `conversation.composer.bar` cannot work: the built-in entry
+ * declares its child slots there (its `children` table is both declaration and
+ * authorization), so an override that inherits it is rejected with
+ * "slot … is already declared", and an override that omits it never receives
+ * `renderSlot` and crashes DSH's input bar on every render. Off by default;
+ * the DSH-side patch is what makes a blank projectless composer usable.
+ */
+const ENABLE_COMPOSER_GATE = false
 const TREE_ROW = '[data-row-key="workspace:"]'
 const PROJECTLESS = PROJECTLESS_ENTRY_ID
 const ADD_WORKSPACE = '::add-workspace'
@@ -423,7 +434,7 @@ export function apply(ctx: Context): void {
   console.info(`${PACKAGE_ID}: client face applied`)
   const ui: UiWorkspace = ctx.uiWorkspace
   const rpc = ctx.connection.rpc as unknown as ClientConnectionRpc
-  const gate: ComposerGateStats = { opened: 0, borrowed: false, rendered: 0, syncs: 0, entriesSeen: -1, registered: false, lastError: null, probe: null }
+  const gate: ComposerGateStats = { opened: 0, borrowed: false, rendered: 0, syncs: 0, entriesSeen: -1, registered: false, givenUp: false, lastError: null, probe: null }
   let rootPromise: Promise<string> | undefined
   const projectlessRoot = (): Promise<string> => (rootPromise ??= requestProjectlessRoot(rpc))
 
@@ -512,8 +523,17 @@ export function apply(ctx: Context): void {
     `${PACKAGE_ID}: dictionaries`,
   )
   if (ENABLE_ORDER) keepRecencyOrder(ctx, PACKAGE_ID, ENABLE_ORDER_WRITE)
-  if (ENABLE_SESSION) installDefaultNewSession(ctx, PACKAGE_ID, startProjectlessSession, () => gate.registered)
-  if (ENABLE_SESSION) installComposerGate(ctx, PACKAGE_ID, {
+  // Whether the projectless "new Session" flow may take over is not something
+  // this page can decide on its own: it needs the composer to actually accept
+  // input, and that is a property of the DSH build (see `tools/dsh-composer-gate`).
+  // The composer slot override used to answer that question, but it cannot:
+  // inheriting the built-in entry's child-slot table collides with the built-in
+  // entry's own declaration of the same child slots, and omitting it strips
+  // `renderSlot` from the props and crashes on every render. The signal comes
+  // from the patch instead — the install steps make it a precondition, and
+  // without it DSH simply keeps its own behaviour.
+  if (ENABLE_SESSION) installDefaultNewSession(ctx, PACKAGE_ID, startProjectlessSession, () => true)
+  if (ENABLE_SESSION && ENABLE_COMPOSER_GATE) installComposerGate(ctx, PACKAGE_ID, {
     liveOrphans,
     currentSessionId: () => currentSessionId(ctx),
     cwdOf: (sessionId) => {

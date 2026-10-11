@@ -59,6 +59,8 @@ export interface ComposerGateStats {
   entriesSeen: number
   /** Whether the override was accepted by the slot registry. */
   registered: boolean
+  /** Set once the override is proven impossible, so retries stop for good. */
+  givenUp: boolean
   lastError: string | null
   /** Most recent gate decision, for diagnosing a gate that never opens. */
   probe: string | null
@@ -175,7 +177,10 @@ export function installComposerGate(
   ctx.effect(() => {
     let dispose: (() => void) | undefined
     let borrowed: unknown
+    /** The retry interval; declared here so `sync` can retire it from inside. */
+    let interval: number | undefined
     const sync = (): void => {
+      if (stats.givenUp) return
       stats.syncs += 1
       let entries: readonly SlotEntry[]
       try {
@@ -230,6 +235,14 @@ export function installComposerGate(
         stats.registered = false
         stats.lastError = `register: ${String(reason).slice(0, 140)}`
         console.warn(`${pluginName}: cannot register the composer gate:`, reason)
+        // A declaration clash never resolves itself: the built-in entry keeps
+        // its child-slot table for as long as it is registered, so retrying can
+        // only produce the same error. Give up instead of looping forever.
+        if (String(reason).includes('already declared')) {
+          stats.givenUp = true
+          stats.lastError = `register: gave up — ${String(reason).slice(0, 120)}`
+          if (interval !== undefined) window.clearInterval(interval)
+        }
       }
     }
     let unsubscribe = (): void => {}
@@ -247,15 +260,15 @@ export function installComposerGate(
     // itself. Keeping it alive forever would mean a slot lookup every 5 seconds
     // for the rest of the page's life, for no benefit.
     const timers = [200, 800, 2000, 5000, 10000].map(delay => window.setTimeout(sync, delay))
-    const interval = window.setInterval(() => {
+    interval = window.setInterval(() => {
       sync()
-      if (stats.registered) window.clearInterval(interval)
+      if (stats.registered && interval !== undefined) window.clearInterval(interval)
     }, 5000)
     sync()
-    if (stats.registered) window.clearInterval(interval)
+    if (stats.registered && interval !== undefined) window.clearInterval(interval)
     return () => {
       for (const timer of timers) window.clearTimeout(timer)
-      window.clearInterval(interval)
+      if (interval !== undefined) window.clearInterval(interval)
       try { unsubscribe() } catch { /* already gone */ }
       try { dispose?.() } catch { /* already gone */ }
       dispose = undefined
