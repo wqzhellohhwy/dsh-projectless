@@ -52,7 +52,7 @@ import {
 const PACKAGE_ID = 'dsh-projectless'
 const VERSION = '1.0.0'
 /** Bumped on every build so a stale page is distinguishable from a fresh one. */
-const BUILD = 52
+const BUILD = 55
 /**
  * Run the self-test on every page load. Always false in a build that is meant
  * to be used: the self-test opens and closes real Sessions on screen, so it
@@ -408,6 +408,27 @@ async function selfCheck(
   })
 }
 
+/** One Session's input shell, for the attachment probes. */
+function probeShell(ctx: Context, sessionId: string | undefined): {
+  snapshot?: { attachmentIds?: readonly string[], draft?: string } | undefined
+  removeAttachment?: (id: string) => unknown
+} | undefined {
+  if (sessionId === undefined) return undefined
+  try {
+    const input = (ctx.get('conversation' as never) as unknown as {
+      input?: {
+        shell?: (id: string) => {
+          snapshot?: { attachmentIds?: readonly string[], draft?: string }
+          removeAttachment?: (id: string) => unknown
+        } | undefined
+      }
+    } | undefined)?.input
+    return input?.shell?.(sessionId)
+  } catch {
+    return undefined
+  }
+}
+
 /** The Session the main view currently retains. */
 function currentSessionId(ctx: Context): SessionId | undefined {
   try {
@@ -654,19 +675,28 @@ export function apply(ctx: Context): void {
           openSession: sessionId => { ui.openSession(sessionId as never) },
           liveAttachments: () => liveAttachmentCount(ctx),
           shellState: (sessionId) => {
-            if (sessionId === undefined) return undefined
+            const shell = probeShell(ctx, sessionId)
+            if (shell === undefined) return undefined
+            return {
+              ids: shell.snapshot?.attachmentIds?.length ?? -1,
+              draft: (shell.snapshot?.draft ?? '').length,
+              sameShell: true,
+            }
+          },
+          shellAttachmentIds: (sessionId) => probeShell(ctx, sessionId)?.snapshot?.attachmentIds ?? [],
+          removeAttachment: (sessionId, attachmentId) => {
+            const shell = probeShell(ctx, sessionId)
+            if (shell?.removeAttachment === undefined) return false
             try {
-              const input = (ctx.get('conversation' as never) as unknown as {
-                input?: { shell?: (id: string) => { snapshot?: { attachmentIds?: readonly string[], draft?: string } } }
-              } | undefined)?.input
-              const shell = input?.shell?.(sessionId)
-              return {
-                ids: shell?.snapshot?.attachmentIds?.length ?? -1,
-                draft: (shell?.snapshot?.draft ?? '').length,
-                sameShell: shell !== undefined,
-              }
+              // Both statements of DSH's own delete path (lib/client.js:18401):
+              // remove from the shell, then release the bytes.
+              if (shell.removeAttachment(attachmentId) === false) return false
+              const conversation = ctx.get('conversation' as never) as unknown as
+                { releaseDraftAttachment?: (id: string) => void } | undefined
+              conversation?.releaseDraftAttachment?.(attachmentId)
+              return true
             } catch {
-              return undefined
+              return false
             }
           },
         })

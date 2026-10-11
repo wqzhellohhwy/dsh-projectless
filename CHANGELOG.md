@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.8.0
+
+### 修复：区分「销毁」与「保命」—— 删掉的图片不再自己冒出来
+
+上一版把 `releaseDraftAttachment` 一律拦下，于是用户点 × 删掉的图，切走再切回会**复活**；
+而一张永不过期的「会话 → ids」表还会把陈年图片补进**别的**会话（老会话也会突然刷出图）。
+两个现象同一个病根：**把一个函数当成了只有一个含义**，而它其实从四个地方被调用：
+
+| 来源 | 路径 | 应当 |
+| --- | --- | --- |
+| 用户点 × 删图 | `shell.removeAttachment` → release | **销毁** |
+| 切会话导致 shell 销毁 | `shell.dispose()` → release | 保留 |
+| 发送成功后 | `commandAttachments.release` → release | 销毁 |
+| 切工作区移交 | 新 shell 接管后再 `removeAttachment` | 销毁 |
+
+**关键判别信号**：只有「shell 销毁」这一条不经过 `shell.removeAttachment`。于是用保护集：
+
+1. 包装 `shell.dispose` —— 销毁前把该 shell 的附件 id 放进**保护集**，并记下「会话 → ids」；
+2. 包装 `shell.removeAttachment` —— 一旦调用即从保护集**移出**（这是"真的不要了"）；
+3. 包装 `releaseDraftAttachment` —— **只拦保护集里的 id**，其余一律放行走原实现真正销毁。
+
+隔离与过期：
+
+4. **恢复只发生在一个 shell 对象第一次被见到时**（重建的 shell 是新对象），
+   而不是"列表为空就补"——后者正是"删了又冒出来"的成因；
+5. **记录用一次即弃**，并给表加上限（16 个会话）；LRU 上限（64）继续管内存。
+
+实测（build 55，桌面版，合成真实粘贴 + 真实删除两步路径）：
+```
+after-paste                thumbs=1  live=1  shellIds=1
+after-switch-back          thumbs=1  live=1  shellIds=1   ← 切换后保留 ✓
+after-remove               thumbs=0  live=0  shellIds=0   ← 删除真的销毁 ✓
+after-remove-switch-back   thumbs=0  live=0  shellIds=0   ← 删掉的不复活 ✓
+```
+
+回归测试扩到 6 组 21 项断言，其中第 2、3 组专门锁死这两个 bug；替身按 DSH 的真实调用
+关系写成（`dispose` 会逐个 release、`removeAttachment` 成功后也会 release），并且强制
+测试经过 `conversation.input.shell()` —— 绕过包装就等于没装插件，会给出假绿。
 ## 1.7.0
 
 ### 修复：图片跨会话丢失的第二层 —— shell 的附件 id 列表需要恢复

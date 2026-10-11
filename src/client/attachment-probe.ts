@@ -43,6 +43,21 @@ interface ProbeDeps {
    * thumbnail vanishes while the bytes sit there unused.
    */
   shellState(sessionId: string | undefined): { ids: number, draft: number, sameShell: boolean } | undefined
+  /**
+   * The attachment ids a Session's shell is currently asked to draw. Used to
+   * drive the deletion step the way the UI does.
+   */
+  shellAttachmentIds(sessionId: string | undefined): readonly string[]
+  /**
+   * Remove one attachment through DSH's own path. The × on a thumbnail runs
+   * **two** statements (lib/client.js:18401):
+   *
+   *   if (shell.removeAttachment(id)) conversation.releaseDraftAttachment(id)
+   *
+   * so this does both — calling only the first would leave the bytes in place
+   * and the probe would report a leak that the real UI does not have.
+   */
+  removeAttachment(sessionId: string | undefined, attachmentId: string): boolean
 }
 
 /** Count blob-backed images on screen — what the user actually sees. */
@@ -130,13 +145,45 @@ export async function runAttachmentRoundTrip(ctx: Context, deps: ProbeDeps): Pro
     deps.openSession(start ?? other)
     await wait(2500)
     sample('after-switch-back')
+    const kept = thumbs()
+
+    // Second half: the user deletes the image with the × on the thumbnail, then
+    // navigates away and back. It must NOT come back — a blanket "keep every
+    // release" wrapper resurrects it, which is the bug being fixed here.
+    const ids = deps.shellAttachmentIds(start)
+    const removed = ids.length > 0
+      ? deps.removeAttachment(start, ids[0] as string)
+      : false
+    await wait(1500)
+    sample('after-remove')
+    deps.openSession(other)
+    await wait(2000)
+    deps.openSession(start ?? other)
+    await wait(2500)
+    sample('after-remove-switch-back')
+    const revived = thumbs()
+
+    report(ctx, {
+      phase: 'attachment-roundtrip',
+      pasted,
+      startSession: (start ?? '').slice(0, 18),
+      otherSession: (other ?? '').slice(0, 18),
+      keptAfterSwitch: kept,
+      removalAttempted: ids.length,
+      removed,
+      thumbsAfterRemoveReturn: revived,
+      verdict: (kept >= 1 ? '切换后保留 ✓' : '切换后丢失 ✗')
+        + ' / ' + (revived === 0 ? '删除后不再复活 ✓' : `删除后又复活 ✗ (thumbs=${revived})`),
+      timeline,
+    })
+    return
   }
 
   report(ctx, {
     phase: 'attachment-roundtrip',
     pasted,
     startSession: (start ?? '').slice(0, 18),
-    otherSession: (other ?? '').slice(0, 18),
+    otherSession: null,
     timeline,
   })
 }

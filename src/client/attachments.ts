@@ -1,35 +1,57 @@
 import type { Context } from '@deepseek-ai/cordis'
 
 /**
- * Keep pasted-image drafts alive across Session switches.
+ * Keep a *pasted-image draft* across Session switches — and let go when the user
+ * actually deletes it.
  *
- * Text drafts survive because DSH mirrors them into `localStorage`. Attachments
- * do not: an image lives only in memory, as a `Map` entry plus a blob URL, and
- * `releaseDraftAttachment(id)` (lib/client.js:3637) does two irreversible
- * things —
+ * ## The problem
+ *
+ * Text drafts survive navigation because DSH mirrors them into `localStorage`.
+ * Attachments have no such mirror: an image lives only in memory, as a `Map`
+ * entry plus a blob URL, and `releaseDraftAttachment(id)`
+ * (lib/client.js:3637) destroys both irreversibly —
  *
  *   this.draftAttachments.delete(id);        // the bytes are gone
  *   revokePreview(attachment.previewUrl);    // and the URL is dead for good
  *
- * — so once it runs, nothing can bring the thumbnail back even if the Session's
- * own `attachmentIds` still lists it.
+ * and a rebuilt input shell starts with an empty `attachmentIds`, so even kept
+ * bytes would not be drawn.
  *
- * The fix is to make the release *deferred* rather than destructive. For the
- * most recent `RETAINED_LIMIT` releases this wrapper simply does not call the
- * original: DSH's own `Map` entry stays exactly where the render path reads it,
- * so `resolveDraftAttachments` keeps finding the thumbnail and the blob URL is
- * never revoked. A side table only records *release order*, so that beyond the
- * limit the oldest ids are handed to the original for real — that keeps memory
- * bounded instead of leaking an unbounded pile of blobs.
+ * ## Why the naive fix was wrong
  *
- * What this does **not** do: persist across a page reload. Blob URLs cannot be
- * survived by anything short of storing the bytes (IndexedDB) and re-uploading
- * them, which is a different and much larger change. Scope here is exactly what
- * was asked for — switching Sessions or workspaces keeps the image.
+ * Blanket-intercepting `releaseDraftAttachment` kept the bytes alive — but it
+ * also kept images the user had *deliberately deleted*, and a never-expiring
+ * "remembered ids" table put stale images back into unrelated Sessions. Both
+ * symptoms came from treating one function as if it had one meaning, when it is
+ * reached from four different places:
+ *
+ * | origin                         | path                                     | wanted    |
+ * | ------------------------------ | ---------------------------------------- | --------- |
+ * | user removes an attachment      | `shell.removeAttachment` → release       | destroyed |
+ * | Session switch tears down shell | `shell.dispose()` → release              | kept      |
+ * | prompt sent (attachments used)  | `commandAttachments.release` → release   | destroyed |
+ * | hand-off to another Workspace   | new shell adopts, then `removeAttachment`| destroyed |
+ *
+ * Only one origin is not preceded by `shell.removeAttachment`. That is the
+ * discriminator this module uses:
+ *
+ * 1. `shell.dispose` — before it runs, put that shell's attachment ids into a
+ *    **protected** set and remember them for the Session;
+ * 2. `shell.removeAttachment` — a deliberate removal, so **unprotect** the id;
+ * 3. `releaseDraftAttachment` — intercept **only protected ids**; everything
+ *    else goes straight through to the original and is really destroyed.
+ *
+ * Restoration is deliberately narrow: it happens the **first time a given shell
+ * object is seen** (a rebuilt shell is a new object), and the remembered entry
+ * is consumed on use. A shell that is already known is never re-populated, so
+ * deleting every image cannot resurrect them.
  */
 
-/** How many released attachments stay resolvable before the oldest is dropped. */
+/** How many intercepted releases stay resolvable before the oldest is dropped. */
 const RETAINED_LIMIT = 64
+
+/** How many Sessions may hold a pending restore entry at once. */
+const REMEMBERED_LIMIT = 16
 
 interface AttachmentLike {
   id: string
@@ -42,6 +64,7 @@ interface AttachmentLike {
 interface ShellLike {
   snapshot?: { attachmentIds?: readonly string[], draft?: string } | undefined
   addAttachments?: (ids: readonly string[]) => unknown
+  removeAttachment?: (id: string) => unknown
   dispose?: () => unknown
   /** Marks a shell already wrapped, so a repeat `shell(id)` is a no-op. */
   __projectlessShellHook?: boolean
@@ -54,16 +77,18 @@ interface ConversationFace {
 }
 
 export interface AttachmentRetentionStats {
-  /** Whether the conversation service was reached and the wrapper installed. */
+  /** Whether the conversation service was reached and the wrappers installed. */
   installed: boolean
   /** Attachments currently held alive by this wrapper. */
   retained: number
-  /** Live draft attachments DSH still owns (never released). */
+  /** Live draft attachments DSH still owns. */
   live: number
-  /** Releases that were deferred instead of destroying the attachment. */
+  /** Releases intercepted because they came from a shell teardown. */
   deferred: number
-  /** Times a rebuilt shell had its remembered attachment ids put back. */
+  /** Times a rebuilt shell had its remembered ids put back. */
   restored: number
+  /** Deliberate removals (the × on a thumbnail, or a Workspace hand-off). */
+  forgotten: number
   lastError: string | null
   /** Shape of the service, captured when the wrapper could not install. */
   probe?: string
@@ -91,20 +116,20 @@ function describeService(value: unknown): string {
 }
 
 /**
- * Install the deferred-release wrapper.
+ * Install the wrappers.
  *
  * The lookup goes through `ctx.inject`, not a bare `ctx.get`: the `conversation`
  * service is registered by DSH's own conversation plugin, which applies *after*
- * this one, so a synchronous `get` at apply time returns `undefined`. A probe
- * caught exactly that (`typeof undefined`), and because the install ran only
- * once, nothing was ever wrapped — the feature silently did nothing.
+ * this one, so a synchronous `get` at apply time returns `undefined` (a probe
+ * caught exactly that, and the feature silently did nothing).
  *
- * `inject` defers the callback until the service exists. Idempotent per page: a
- * second install on an already-wrapped service is a no-op, which matters because
- * the client face can be re-applied by a bundle reload.
+ * Idempotent per page: a second install on an already-wrapped service is a
+ * no-op, which matters because the client face can be re-applied by a reload.
  */
 export function keepDraftAttachments(ctx: Context, pluginName: string): AttachmentRetentionStats {
-  const stats: AttachmentRetentionStats = { installed: false, retained: 0, live: 0, deferred: 0, restored: 0, lastError: null }
+  const stats: AttachmentRetentionStats = {
+    installed: false, retained: 0, live: 0, deferred: 0, restored: 0, forgotten: 0, lastError: null,
+  }
 
   const install = (scope: Context): void => {
     if (stats.installed) return
@@ -136,50 +161,41 @@ export function keepDraftAttachments(ctx: Context, pluginName: string): Attachme
     holder.__projectlessRetains = retained
     const original = conversation.releaseDraftAttachment.bind(conversation)
 
+    /** Ids whose release came from a shell teardown, so they must survive it. */
+    const protectedIds = new Set<string>()
+    /** Session id → ids to put back the next time that Session's shell appears. */
+    const remembered = new Map<string, string[]>()
+
     const evict = (): void => {
       while (retained.size > RETAINED_LIMIT) {
         const oldest = retained.keys().next()
         if (oldest.done === true) break
         const id = oldest.value
         retained.delete(id)
+        protectedIds.delete(id)
         try {
           original(id)
         } catch { /* the original is best-effort */ }
       }
     }
 
-    // Only the singular method is wrapped: the plural one fans out to
-    // `this.releaseDraftAttachment`, so it reaches this wrapper on its own.
+    // (3) The only interception point: ids explicitly protected by a teardown.
     conversation.releaseDraftAttachment = (id: string): void => {
-      if (conversation?.draftAttachments?.get(id) === undefined) {
-        // Nothing here to protect — either released before or never known. Let
-        // the original run so unknown ids behave exactly as DSH expects.
+      if (!protectedIds.has(id) || conversation?.draftAttachments?.get(id) === undefined) {
+        // Deliberate removal, an attachment we never held, or an id already
+        // dropped by the LRU — let the original destroy it, as DSH intends.
+        protectedIds.delete(id)
         try { original(id) } catch { /* best effort */ }
         return
       }
-      // Deliberately NOT calling the original: that is what keeps the entry in
-      // the Map the render path reads, and keeps the blob URL unrevoked.
       retained.set(id, { id })
       stats.deferred += 1
       evict()
     }
 
-    // Keeping the bytes alive is not enough: the composer draws
-    // `resolveDraftAttachments(shell.snapshot.attachmentIds)`, and a rebuilt
-    // shell starts with an empty id list. The probe showed exactly that split —
-    // `live=1` (bytes fine) beside `shellIds=0` (nothing to draw) after a switch
-    // away and back, while the *text* draft came back because DSH mirrors that
-    // one into localStorage. So the id list needs the same treatment: remember
-    // it when the shell goes away, put it back when a shell for that Session is
-    // handed out empty.
-    const inputFace = (conversation as ConversationFace & {
-      input?: {
-        shell?: (id: string) => ShellLike | undefined
-      }
-    }).input
+    const inputFace = conversation.input
     if (inputFace !== undefined && typeof inputFace.shell === 'function') {
       const shellFor = inputFace.shell.bind(inputFace)
-      const remembered = new Map<string, string[]>()
       inputFace.shell = (id: string): ShellLike | undefined => {
         let shell: ShellLike | undefined
         try {
@@ -188,22 +204,57 @@ export function keepDraftAttachments(ctx: Context, pluginName: string): Attachme
           return undefined
         }
         if (shell === undefined || shell === null) return shell
+        // A rebuilt shell is a new object, so this branch runs once per shell.
         if (shell.__projectlessShellHook === true) return shell
         shell.__projectlessShellHook = true
+
+        // (1) Teardown: protect this shell's attachments, and remember the ids
+        // for the Session so a fresh shell can be repopulated exactly once.
         const originalDispose = typeof shell.dispose === 'function' ? shell.dispose.bind(shell) : undefined
         if (originalDispose !== undefined) {
           shell.dispose = (): unknown => {
             const ids = shell?.snapshot?.attachmentIds
-            if (Array.isArray(ids) && ids.length > 0) remembered.set(id, [...ids])
+            if (Array.isArray(ids) && ids.length > 0) {
+              for (const one of ids) protectedIds.add(one)
+              remembered.set(id, [...ids])
+              while (remembered.size > REMEMBERED_LIMIT) {
+                const oldest = remembered.keys().next()
+                if (oldest.done === true) break
+                remembered.delete(oldest.value)
+              }
+            }
             return originalDispose()
           }
         }
+
+        // (2) Deliberate removal: the user (or a Workspace hand-off) really does
+        // not want this attachment, so stop protecting it.
+        const originalRemove = typeof shell.removeAttachment === 'function'
+          ? shell.removeAttachment.bind(shell)
+          : undefined
+        if (originalRemove !== undefined) {
+          shell.removeAttachment = (attachmentId: string): unknown => {
+            // Counted unconditionally: this call *is* the "deliberately gone"
+            // signal, whether or not the id happened to be protected at the
+            // time (a plain delete never protects anything first).
+            protectedIds.delete(attachmentId)
+            stats.forgotten += 1
+            return originalRemove(attachmentId)
+          }
+        }
+
+        // Restoration: consumed on use, and only into a shell that has nothing —
+        // a shell we already know never reaches here, so deleting every image
+        // cannot bring them back.
         const stale = remembered.get(id)
-        if (stale !== undefined && stale.length > 0 && (shell.snapshot?.attachmentIds?.length ?? 0) === 0) {
-          try {
-            shell.addAttachments?.(stale)
-            stats.restored += 1
-          } catch { /* the shell may refuse ids it no longer knows */ }
+        if (stale !== undefined) {
+          remembered.delete(id)
+          if ((shell.snapshot?.attachmentIds?.length ?? 0) === 0 && stale.length > 0) {
+            try {
+              shell.addAttachments?.(stale)
+              stats.restored += 1
+            } catch { /* the shell may refuse ids it no longer knows */ }
+          }
         }
         return shell
       }
@@ -211,6 +262,8 @@ export function keepDraftAttachments(ctx: Context, pluginName: string): Attachme
 
     scope.effect(() => () => {
       retained.clear()
+      protectedIds.clear()
+      remembered.clear()
       delete holder.__projectlessRetains
     }, `${pluginName}: retained draft attachments`)
 
