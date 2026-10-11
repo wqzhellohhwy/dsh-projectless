@@ -77,10 +77,22 @@ function isRenderable(value: unknown): boolean {
   return typeof value === 'object' && value !== null && '$$typeof' in (value as object)
 }
 
+/**
+ * The slice of DSH's `StoredEntry` this override needs.
+ *
+ * Note where each field lives — it is not uniform, and getting it wrong is
+ * silent. `priority` sits under `options`, while `children`, `locale` and
+ * `inject` are top-level. `children` in particular is load-bearing: a slot
+ * entry declared as `single` carries its child-slot table there, and the render
+ * machinery derives the `renderSlot` prop from it. Miss it and the override
+ * still registers and still renders — but with a prop bag that is missing
+ * `renderSlot`, so the built-in input bar throws on its first child render.
+ */
 interface SlotEntry {
-  options?: { priority?: number, children?: unknown, config?: unknown } | undefined
-  inject?: unknown
+  options?: { priority?: number, config?: unknown } | undefined
+  children?: unknown
   locale?: unknown
+  inject?: unknown
   component?: unknown
 }
 
@@ -176,6 +188,16 @@ export function installComposerGate(
       const found = entries.find(entry => isRenderable(entry.component) && entry.component !== ComposerGate)
       if (found === undefined) return
       if (dispose !== undefined && borrowed === found.component) return
+      // Refuse to override without the child-slot table. The render machinery
+      // derives `renderSlot` from it, and DSH's input bar calls `renderSlot`
+      // unconditionally; forwarding a prop bag without it throws on every
+      // render. Declining leaves DSH's own entry untouched, which is the safe
+      // outcome — the composer then simply behaves as DSH intends.
+      if (found.children === undefined) {
+        stats.lastError = 'upstream entry exposes no child-slot table; override declined'
+        stats.borrowed = false
+        return
+      }
       builtin = found.component
       borrowed = found.component
       stats.borrowed = true
@@ -183,7 +205,9 @@ export function installComposerGate(
         name: COMPOSER_BAR_SLOT,
         priority: -1,
       }
-      if (found.options?.children !== undefined) options.children = found.options.children
+      // Top-level on `StoredEntry`, NOT under `options` — see the `SlotEntry`
+      // note above for why getting this wrong is silent and fatal.
+      options.children = found.children
       if (found.locale !== undefined) options.locale = found.locale
       // DSH calls a slot's `inject` with the Session the slot belongs to. This
       // wrapper keeps every prop the built-in input bar needs and adds the one
@@ -217,9 +241,18 @@ export function installComposerGate(
     // A late declaration, a slot that was already declared, and a component
     // that only mounts once a Session is open all have to be covered, so the
     // subscription is backed by a short retry ladder.
+    //
+    // The ladder is the retry mechanism, not a heartbeat: once the override is
+    // in place there is nothing left to poll for, so the interval retires
+    // itself. Keeping it alive forever would mean a slot lookup every 5 seconds
+    // for the rest of the page's life, for no benefit.
     const timers = [200, 800, 2000, 5000, 10000].map(delay => window.setTimeout(sync, delay))
-    const interval = window.setInterval(sync, 5000)
+    const interval = window.setInterval(() => {
+      sync()
+      if (stats.registered) window.clearInterval(interval)
+    }, 5000)
     sync()
+    if (stats.registered) window.clearInterval(interval)
     return () => {
       for (const timer of timers) window.clearTimeout(timer)
       window.clearInterval(interval)
